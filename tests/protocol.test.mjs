@@ -158,11 +158,14 @@ describe("queue-mode session (single instance)", () => {
   // work, so the bytes buy real protection). The gate catches unintentional bloat while leaving
   // room for deliberate capability — still ~60% under the 120KB hard ceiling.
   // UNITY_MCP_COMPACT_TOOLS=1 (tested below) goes much further for constrained clients.
+  // 49.5KB for 2.37: unity_page (token-budget paging of large results), nested-property reads
+  // (propertyPath/maxDepth/maxArrayElements), asset_list paging (offset/includeGuid) and console
+  // collapse. The dense-shape verbose flag stays out of core schemas to keep this small.
   // Bump this only for a real new capability, never to absorb prose creep.
   test("tools/list payload stays within the rich-mode diet budget", async () => {
     const { tools } = await client.listTools();
     const bytes = Buffer.byteLength(JSON.stringify(tools), "utf8");
-    assert.ok(bytes <= 48_000, `tools/list ${bytes} bytes exceeds the 48KB rich-mode budget`);
+    assert.ok(bytes <= 49_500, `tools/list ${bytes} bytes exceeds the 49.5KB rich-mode budget`);
   });
 
   // Lazy discovery is three-tier so finding one tool never costs a schema dump:
@@ -498,13 +501,18 @@ describe("queue-mode session (single instance)", () => {
     assert.match(text, /unknown|not found|unity_totally_missing_tool/i);
   });
 
-  test("oversized responses are replaced by pagination guidance (4MB hard limit)", async () => {
-    const { payloadText } = await client.callTool("unity_advanced_tool", {
+  // Paging (default 20k-token budget) now handles oversized results before the 4MB transport
+  // guard is reached; that guard is covered with paging disabled in tests/paging.test.mjs.
+  test("oversized responses arrive paged: page 1 + a unity_page cursor notice", async () => {
+    const { blocks, payloadText } = await client.callTool("unity_advanced_tool", {
       tool: "unity_payload_huge",
       params: {},
     });
-    assert.ok(payloadText.length < 100_000, `hard limit must shrink the response (got ${payloadText.length} chars)`);
-    assert.match(payloadText, /too large|limit|pagination|maxNodes|truncat/i);
+    const texts = blocks.filter((b) => b.type === "text");
+    const page = texts.at(-2).text;
+    assert.ok(page.length <= 50_000, `page 1 fits the default budget (got ${page.length} chars)`);
+    assert.equal(typeof JSON.parse(page).data.blob, "string", "page 1 is valid JSON with the same shape");
+    assert.match(payloadText, /Page 1\/\d+ of unity_payload_huge.*unity_page \{"cursor":"[0-9a-f]+","page":2\}/);
   });
 
   test("stdout carried only clean JSON-RPC for the entire session", () => {

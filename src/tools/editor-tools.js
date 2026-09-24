@@ -4,6 +4,25 @@ import { formatResult, looksLikeErrorObject } from "../response-format.js";
 import { isUnknownRouteResult } from "../capabilities.js";
 import { delay, isRequestCancelled } from "../request-context.js";
 
+// ─── Dense response shapes (plugin 2.41+) ───
+// Read endpoints answer in token-dense JSON: default-valued / derivable fields omitted,
+// vectors as arrays, row lists as tables. Nothing is dropped; verbose:true restores the
+// legacy shape. The wording below ships in tools/list, so it stays short.
+// Tables are self-describing ({columns, common?, groupedBy, groups}), so they need no prose.
+const VERBOSE_PARAM = { type: "boolean", description: "Legacy full shape" };
+const PROPERTY_READ_NOTE = " Nested arrays/structs included.";
+// Core tools omit verbose from their schema (tools/list is paid every session); the plugin
+// accepts verbose:true on every dense endpoint regardless.
+const PROPERTY_READ_PARAMS = {
+  propertyPath: { type: "string", description: "Read one nested property (e.g. a $more path)" },
+  maxDepth: { type: "number", description: "Nesting depth (default 4)" },
+  maxArrayElements: { type: "number", description: "Items per array (default 100)" },
+};
+
+/** Tool schemas name the scene object objectPath; plugins before 2.41 only read gameObjectPath. */
+const withGameObjectPath = (params = {}) =>
+  params.objectPath && !params.gameObjectPath ? { ...params, gameObjectPath: params.objectPath } : params;
+
 const BAKE_STATUS_POLL_MS = 2000;
 const BAKE_DEFAULT_WAIT_SECONDS = 60;
 const BAKE_MAX_WAIT_SECONDS = 1800;
@@ -95,7 +114,7 @@ function imageResultBlocks(result, noImageError) {
 // one explicit parameter away, so no capability is lost.
 const ERROR_LIKE_LOG_TYPES = new Set(["error", "exception", "assert"]);
 
-function shapeConsoleLogResult(result, includeStackTrace, maxStackFrames) {
+function shapeConsoleLogResult(result, includeStackTrace, maxStackFrames, collapse = true) {
   const mode = includeStackTrace === "all" || includeStackTrace === "none" ? includeStackTrace : "errors";
   const frameCap = Number.isInteger(maxStackFrames) && maxStackFrames > 0 ? maxStackFrames : 6;
   const entries = result?.data?.entries;
@@ -116,7 +135,38 @@ function shapeConsoleLogResult(result, includeStackTrace, maxStackFrames) {
     };
   });
 
-  return { ...result, data: { ...result.data, entries: shaped } };
+  return { ...result, data: { ...result.data, entries: collapse ? collapseConsoleEntries(shaped) : shaped } };
+}
+
+/**
+ * Merge identical entries (type + message + kept trace) into one with a repeat count, like
+ * the Console's Collapse toggle. Plugins 2.41+ already collapse, but only on the full trace;
+ * after trimming, traces that differed in dropped frames collapse here too, and older plugins
+ * get the same shape. The first occurrence keeps its position.
+ */
+function collapseConsoleEntries(entries) {
+  const byKey = new Map();
+  const out = [];
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") {
+      out.push(entry);
+      continue;
+    }
+    const key = `${entry.type}\u0000${entry.message}\u0000${entry.stackTrace ?? ""}`;
+    const seen = byKey.get(key);
+    if (!seen) {
+      const copy = { ...entry };
+      byKey.set(key, copy);
+      out.push(copy);
+      continue;
+    }
+    seen.repeats = (seen.repeats || 1) + (entry.repeats || 1);
+    const firsts = [seen.firstTimestamp ?? seen.timestamp, entry.firstTimestamp ?? entry.timestamp].filter(Boolean).sort();
+    const lasts = [seen.timestamp, entry.timestamp].filter(Boolean).sort();
+    if (firsts.length) seen.firstTimestamp = firsts[0];
+    if (lasts.length) seen.timestamp = lasts[lasts.length - 1];
+  }
+  return out;
 }
 
 export const editorTools = [
@@ -197,7 +247,7 @@ export const editorTools = [
         maxDepth: { type: "number", description: "Maximum depth to traverse (default: 10)" },
         maxNodes: { type: "number", description: "Maximum total nodes to return (default: 5000). Use lower values for very large scenes to avoid timeouts." },
         parentPath: { type: "string", description: "Only return hierarchy under this GameObject path (e.g. 'Canvas/Panel'). Useful for exploring specific subtrees in large scenes." },
-        verbose: { type: "boolean", description: "Emit every per-node field even at default values (the pre-2.37 shape)." },
+        verbose: VERBOSE_PARAM,
       },
     },
     handler: async (params) => formatResult(await bridge.getHierarchy(params)),
@@ -251,7 +301,9 @@ export const editorTools = [
   },
   {
     name: "unity_gameobject_info",
-    description: "Get detailed info about a specific GameObject: transform, components, children, active state, tags, layer.",
+    description:
+      "Get detailed info about a specific GameObject: transform, components, children, active state, tags, layer. " +
+      "Absent fields are defaults.",
     inputSchema: {
       type: "object",
       properties: {
@@ -308,12 +360,13 @@ export const editorTools = [
   },
   {
     name: "unity_component_get_properties",
-    description: "Get all serialized properties of a component on a GameObject.",
+    description: "Get all serialized properties of a component on a GameObject." + PROPERTY_READ_NOTE,
     inputSchema: {
       type: "object",
       properties: {
         gameObjectPath: { type: "string", description: "Path or name of the target GameObject" },
         componentType: { type: "string", description: "Component type name" },
+        ...PROPERTY_READ_PARAMS,
       },
       required: ["gameObjectPath", "componentType"],
     },
@@ -458,6 +511,8 @@ export const editorTools = [
         search: { type: "string", description: "Search query string" },
         recursive: { type: "boolean", description: "Search recursively in subfolders (default: true)" },
         maxResults: { type: "number", description: "Maximum assets to return (default: 500). Use lower values for large projects." },
+        offset: { type: "number", description: "Skip N matches (the reply's nextOffset)" },
+        includeGuid: { type: "boolean", description: "Include GUIDs (default: true)" },
       },
     },
     handler: async (params) => formatResult(await bridge.getAssetList(params)),
@@ -648,12 +703,17 @@ export const editorTools = [
           description: "Traces to keep: 'errors' (default, error-like entries only, trimmed), 'all', 'none'.",
         },
         maxStackFrames: { type: "number", description: "Frames kept per retained trace (default: 6)" },
+        collapse: {
+          type: "boolean",
+          description: "Merge identical entries, with repeats (default: true)",
+        },
       },
     },
     handler: async (params) => {
       const { includeStackTrace, maxStackFrames, ...bridgeParams } = params || {};
       const result = await bridge.getConsoleLog(bridgeParams);
-      return formatResult(shapeConsoleLogResult(result, includeStackTrace, maxStackFrames));
+      const collapse = bridgeParams.collapse !== false && bridgeParams.verbose !== true;
+      return formatResult(shapeConsoleLogResult(result, includeStackTrace, maxStackFrames, collapse));
     },
   },
   {
@@ -1319,6 +1379,8 @@ export const editorTools = [
       properties: {
         assetPath: { type: "string", description: "Asset path of the prefab (e.g. 'Assets/Prefabs/Player.prefab')" },
         maxDepth: { type: "number", description: "Maximum hierarchy depth to traverse (default: 10)" },
+        maxNodes: { type: "number", description: "Maximum nodes (default: 5000)" },
+        verbose: VERBOSE_PARAM,
       },
       required: ["assetPath"],
     },
@@ -1333,6 +1395,8 @@ export const editorTools = [
         assetPath: { type: "string", description: "Asset path of the prefab (e.g. 'Assets/Prefabs/Player.prefab')" },
         prefabPath: { type: "string", description: "Path within the prefab hierarchy to the target GameObject (e.g. 'Body/Head'). Empty or omitted = prefab root." },
         componentType: { type: "string", description: "Component type name (e.g. 'MeshRenderer', 'PlayerController')" },
+        ...PROPERTY_READ_PARAMS,
+        verbose: VERBOSE_PARAM,
       },
       required: ["assetPath", "componentType"],
     },
@@ -1845,6 +1909,7 @@ export const editorTools = [
       type: "object",
       properties: {
         typeName: { type: "string", description: "Component type name (e.g. 'Rigidbody', 'Camera', 'MyScript')" },
+        limit: { type: "number", description: "Maximum results (default: 500)" },
       },
       required: ["typeName"],
     },
@@ -2810,6 +2875,7 @@ export const editorTools = [
       properties: {
         shader: { type: "string", description: "Shader name to search for (partial match)" },
         limit: { type: "number", description: "Maximum results to return (default: 500)." },
+        verbose: VERBOSE_PARAM,
       },
       required: ["shader"],
     },
@@ -2825,6 +2891,7 @@ export const editorTools = [
         type: { type: "string", description: "Asset type filter (e.g. 'Material', 'Texture2D', 'Prefab', 'Scene', 'AnimationClip', 'ScriptableObject')" },
         folder: { type: "string", description: "Folder to search in (e.g. 'Assets/Prefabs')" },
         maxResults: { type: "number", description: "Maximum results to return (default: 100)" },
+        includeGuid: { type: "boolean", description: "Include GUIDs (default: true)" },
       },
     },
     handler: async (params) => formatResult(await bridge.searchAssets(params)),
@@ -3187,7 +3254,7 @@ export const editorTools = [
       },
     },
     handler: async (params) =>
-      formatResult(await bridge.getMeshInfo(params)),
+      formatResult(await bridge.getMeshInfo(withGameObjectPath(params))),
   },
   {
     name: "unity_graphics_material_info",
@@ -3216,10 +3283,12 @@ export const editorTools = [
           description:
             "Include a base64 PNG preview thumbnail (default: true)",
         },
+        previewSize: { type: "number", description: "Preview size in px (default: 128, 0 = none)" },
+        verbose: VERBOSE_PARAM,
       },
     },
     handler: async (params) => {
-      const result = await bridge.getMaterialInfo(params);
+      const result = await bridge.getMaterialInfo(withGameObjectPath(params));
       const hasImage = typeof (result.data?.base64 || result.base64) === "string";
       return hasImage
         ? imageResultBlocks(result, "Material preview returned no image data")
@@ -3243,6 +3312,7 @@ export const editorTools = [
           description:
             "Preview thumbnail size in pixels (default: 128). Set 0 to skip preview.",
         },
+        includePreview: { type: "boolean", description: "Include the preview (default: true)" },
       },
       required: ["assetPath"],
     },
@@ -3269,7 +3339,7 @@ export const editorTools = [
       required: ["objectPath"],
     },
     handler: async (params) =>
-      formatResult(await bridge.getRendererInfo(params)),
+      formatResult(await bridge.getRendererInfo(withGameObjectPath(params))),
   },
   {
     name: "unity_graphics_lighting_summary",
@@ -3891,11 +3961,13 @@ export const editorTools = [
   },
   {
     name: "unity_scriptableobject_info",
-    description: "Get all serialized properties and values of a ScriptableObject asset.",
+    description: "Get all serialized properties and values of a ScriptableObject asset." + PROPERTY_READ_NOTE,
     inputSchema: {
       type: "object",
       properties: {
         path: { type: "string", description: "Asset path of the ScriptableObject" },
+        ...PROPERTY_READ_PARAMS,
+        verbose: VERBOSE_PARAM,
       },
       required: ["path"],
     },
@@ -4192,6 +4264,7 @@ export const editorTools = [
       type: "object",
       properties: {
         query: { type: "string", description: "Search query" },
+        limit: { type: "number", description: "Maximum results (default: 50)" },
       },
       required: ["query"],
     },

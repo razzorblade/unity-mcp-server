@@ -124,6 +124,8 @@ describe("live ProBuilder level build (write probes, self-cleaning)", { skip: !L
     // AT the carved wall (a double-offset bug once pushed it a full wall-position away).
     const info = data((await call("unity_gameobject_info", { instanceId: boolResult.instanceId })).payload);
     const pos = info.position || (info.transform && info.transform.position);
+    // Plugin 2.41+ emits vectors as [x,y,z]; older plugins as {x,y,z}.
+    if (Array.isArray(pos)) [pos.x, pos.y, pos.z] = pos;
     assert.ok(pos, `gameobject_info returns a position (${JSON.stringify(info).slice(0, 200)})`);
     assert.ok(
       Math.abs(pos.z - 6) < 1.5 && Math.abs(pos.x) < 1.5,

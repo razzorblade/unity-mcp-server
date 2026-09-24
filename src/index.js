@@ -56,6 +56,7 @@ import { runWithRequestContext, getRequestContext } from "./request-context.js";
 import { rootsToPaths, isVirtualPlayerInstance } from "./workspace-affinity.js";
 import { debugLog } from "./state-persistence.js";
 import { isErrorText, firstSentence, stripSchemaDescriptions } from "./response-format.js";
+import { paginateResult, pageTools } from "./pagination.js";
 import { CONFIG } from "./config.js";
 
 // ─── Response size protection ───
@@ -126,6 +127,7 @@ const ALL_TOOLS = [
   ...coreTools,
   ...metaTools,
   ...contextTools,
+  ...pageTools,
 ];
 console.error(
   `[MCP] Tool tiers: ${coreCount} core + ${advancedCount} advanced (via unity_advanced_tool) = ${coreCount + advancedCount} total, ${ALL_TOOLS.length} exposed`
@@ -389,6 +391,7 @@ function createProgressReporter(extra, meta) {
 const TOOLS_SKIP_PORT_INJECT = new Set([
   "unity_select_instance",
   "unity_list_instances",
+  "unity_page",
 ]);
 
 // ─── Compact tool registry mode (UNITY_MCP_COMPACT_TOOLS=1) ───
@@ -479,7 +482,9 @@ async function executeTool(tool, name, args, portOverride) {
   // Auto-discover instances on first tool call (unless it's an instance tool itself)
   // Skip auto-discovery when port override is active — the caller already knows where to route.
   let instancePrompt = null;
-  if (!portOverride && name !== "unity_list_instances" && name !== "unity_select_instance") {
+  // unity_page reads the server-side page cache: no Unity instance involved.
+  const local = name === "unity_page";
+  if (!portOverride && !local && name !== "unity_list_instances" && name !== "unity_select_instance") {
     instancePrompt = await ensureInstanceDiscovery();
   }
 
@@ -489,6 +494,7 @@ async function executeTool(tool, name, args, portOverride) {
   debugLog(`Tool=${name}, portOverride=${portOverride || 'null'}, selectionRequired=${selectionRequired}, selectedPort=${getSelectedInstance()?.port || 'null'}, instancePrompt=${instancePrompt ? 'SET' : 'null'}`);
   if (
     selectionRequired &&
+    !local &&
     !name.startsWith("unity_hub_") &&
     name !== "unity_list_instances" &&
     name !== "unity_select_instance" &&
@@ -536,7 +542,15 @@ async function executeTool(tool, name, args, portOverride) {
   if (Array.isArray(result)) {
     contentBlocks.push(...result);
   } else {
-    contentBlocks.push({ type: "text", text: result });
+    // Token budget: a result too large for the client is split into pages (page 1 now,
+    // the rest via unity_page) instead of being silently truncated by the client.
+    const toolLabel = name === "unity_advanced_tool" && typeof args?.tool === "string" ? args.tool : name;
+    const paged = paginateResult(toolLabel, result);
+    if (paged) {
+      contentBlocks.push({ type: "text", text: paged.text }, { type: "text", text: paged.notice });
+    } else {
+      contentBlocks.push({ type: "text", text: result });
+    }
   }
 
   // Logical failures come back as HTTP 200 payloads ({success:false}, {error}, ...)
