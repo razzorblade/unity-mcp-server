@@ -10,8 +10,14 @@
 //
 // Multi-instance support:
 //   Discovers all running Unity Editor instances (via shared registry + port scanning).
-//   On first tool call, auto-selects if only one instance is found.
-//   If multiple instances are running, prompts the user to select one.
+//   On first tool call, auto-selects the only running editor, or the editor whose project
+//   matches this session's workspace (UNITY_PROJECT_PATH, MCP roots, cwd). Otherwise the
+//   user picks one. MPPM Virtual Players never count as a separate editor.
+//
+// Request isolation:
+//   The SDK runs tool calls concurrently. Each call's routing (agent id, explicit port),
+//   cancellation signal and progress reporter live in an AsyncLocalStorage request context,
+//   so parallel calls can never reroute each other.
 //
 // Project Context:
 //   Exposes project-specific documentation via MCP Resources and a dedicated tool.
@@ -27,6 +33,7 @@ import {
   ListToolsRequestSchema,
   ListResourcesRequestSchema,
   ReadResourceRequestSchema,
+  RootsListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { hubTools } from "./tools/hub-tools.js";
@@ -36,16 +43,17 @@ import { probuilderTools } from "./tools/probuilder-tools.js";
 import { contextTools } from "./tools/context-tools.js";
 import { instanceTools } from "./tools/instance-tools.js";
 import { splitToolTiers } from "./tool-tiers.js";
-import { setAgentId, getProjectContext } from "./unity-editor-bridge.js";
+import { getProjectContext } from "./unity-editor-bridge.js";
 import {
   autoSelectInstance,
   getSelectedInstance,
   isInstanceSelectionRequired,
   validateSelectedInstance,
-  setCurrentAgent,
-  setPortOverride,
-  clearPortOverride,
+  setWorkspaceRootsProvider,
+  defaultWorkspaceRootTiers,
 } from "./instance-discovery.js";
+import { runWithRequestContext, getRequestContext } from "./request-context.js";
+import { rootsToPaths, isVirtualPlayerInstance } from "./workspace-affinity.js";
 import { debugLog } from "./state-persistence.js";
 import { isErrorText, firstSentence, stripSchemaDescriptions } from "./response-format.js";
 import { CONFIG } from "./config.js";
@@ -105,7 +113,6 @@ function truncateResponseIfNeeded(contentBlocks) {
 // Each MCP stdio process = one Cowork agent.
 // Generate a unique ID so the Unity plugin can track and schedule fairly.
 const PROCESS_AGENT_ID = `agent-${process.pid}-${randomBytes(3).toString("hex")}`;
-setAgentId(PROCESS_AGENT_ID);
 
 // ─── Combine all tools (two-tier system) ───
 // Split editor tools into core (always exposed) and advanced (on-demand via meta-tool).
@@ -136,6 +143,9 @@ let _contextCache = null; // Shared cache (same project context for all agents)
 
 // Instance auto-discovery: each agent discovers instances on their first tool call.
 const _discoveryDonePerAgent = new Map(); // agentId → boolean
+// First-call discovery in flight, so concurrent first calls share one discovery instead of
+// racing ahead to the default port before the selection exists.
+const _discoveryInFlight = new Map(); // agentId → Promise
 
 async function getContextSummaryOnce() {
   if (_contextInjectedPerAgent.get(PROCESS_AGENT_ID)) return null;
@@ -182,40 +192,57 @@ async function getContextSummaryOnce() {
  * Returns a prompt string if user needs to select an instance, or null.
  */
 async function ensureInstanceDiscovery() {
-  const _instanceDiscoveryDone = _discoveryDonePerAgent.get(PROCESS_AGENT_ID) || false;
-  debugLog(`ensureInstanceDiscovery: _instanceDiscoveryDone=${_instanceDiscoveryDone}, selectedPort=${getSelectedInstance()?.port || 'null'}, selectionRequired=${isInstanceSelectionRequired()}`);
+  const agentId = getRequestContext().agentId;
+  const inFlight = _discoveryInFlight.get(agentId);
+  if (inFlight) {
+    // A concurrent first call is discovering; wait for its selection. It reports the banner.
+    await inFlight;
+    return null;
+  }
 
-  if (_instanceDiscoveryDone) {
-    // Discovery already done (likely restored from persistence).
-    // Validate that the persisted instance selection still points to the correct project.
+  const discoveryDone = _discoveryDonePerAgent.get(agentId) || false;
+  debugLog(`ensureInstanceDiscovery: discoveryDone=${discoveryDone}, selectedPort=${getSelectedInstance()?.port || 'null'}, selectionRequired=${isInstanceSelectionRequired()}`);
+
+  if (discoveryDone) {
+    // Validate that the instance selection still points to the correct project.
     // This detects port swaps: e.g. ProjectA was on port 7891 but now ProjectB is there.
     const validated = await validateSelectedInstance();
     if (validated) {
-      debugLog(`Persisted selection validated OK: ${validated.projectName} on port ${validated.port}`);
+      debugLog(`Selection validated OK: ${validated.projectName} on port ${validated.port}`);
     } else if (getSelectedInstance() === null) {
-      // Validation cleared the selection (project no longer running).
-      // Re-run discovery on next call.
-      debugLog(`Persisted selection invalidated — project no longer found. Will re-discover.`);
-      _discoveryDonePerAgent.set(PROCESS_AGENT_ID, false);
+      // Validation cleared the selection (project no longer running). Re-discover next call.
+      debugLog(`Selection invalidated — project no longer found. Will re-discover.`);
+      _discoveryDonePerAgent.set(agentId, false);
     }
     return null;
   }
 
-  _discoveryDonePerAgent.set(PROCESS_AGENT_ID, true);
+  _discoveryDonePerAgent.set(agentId, true);
+  const run = discoverAndDescribe();
+  _discoveryInFlight.set(agentId, run);
+  try {
+    return await run;
+  } finally {
+    _discoveryInFlight.delete(agentId);
+  }
+}
 
+async function discoverAndDescribe() {
   try {
     const result = await autoSelectInstance();
 
     if (result.autoSelected) {
-      // Single instance found and auto-selected
       const inst = result.instance;
       const cloneInfo = inst.isClone ? ` (ParrelSync clone #${inst.cloneIndex})` : "";
+      const others = result.instances.length - 1;
       return (
         `=== UNITY INSTANCE (auto-connected) ===\n` +
         `Project: ${inst.projectName}${cloneInfo}\n` +
         `Port: ${inst.port}\n` +
         `Unity: ${inst.unityVersion || "unknown"}\n` +
         `Path: ${inst.projectPath || "unknown"}\n` +
+        (result.reason ? `Why: ${result.reason}\n` : "") +
+        (others > 0 ? `(${others} other instance(s) running. unity_list_instances / unity_select_instance to switch.)\n` : "") +
         `=== END INSTANCE INFO ===`
       );
     }
@@ -255,7 +282,8 @@ async function ensureInstanceDiscovery() {
 
     for (const inst of result.instances) {
       const cloneInfo = inst.isClone ? ` [ParrelSync clone #${inst.cloneIndex}]` : "";
-      prompt += `  • Port ${inst.port}: ${inst.projectName}${cloneInfo} (Unity ${inst.unityVersion || "?"})\n`;
+      const vpInfo = isVirtualPlayerInstance(inst) ? " [Multiplayer Play Mode virtual player]" : "";
+      prompt += `  • Port ${inst.port}: ${inst.projectName}${cloneInfo}${vpInfo} (Unity ${inst.unityVersion || "?"})\n`;
       if (inst.projectPath) {
         prompt += `    Path: ${inst.projectPath}\n`;
       }
@@ -263,6 +291,8 @@ async function ensureInstanceDiscovery() {
 
     prompt +=
       `\nCall unity_select_instance with the port number once the user has chosen.\n` +
+      `Tip: set UNITY_PROJECT_PATH in this MCP server's env (or launch it from the project folder) ` +
+      `to auto-select this project's editor.\n` +
       `=== END INSTANCE SELECTION REQUIRED ===`;
 
     return prompt;
@@ -297,12 +327,58 @@ const server = new Server(
       "Use the unity_* MCP tools for all Unity operations — they handle queuing, retries, and agent identity automatically.",
       "",
       "MULTI-INSTANCE: This MCP server supports multiple Unity Editor instances running simultaneously.",
-      "On your first tool call, instances are auto-discovered. If multiple instances are found,",
-      "you MUST ask the user which instance to work with and call unity_select_instance before proceeding.",
-      "Use unity_list_instances to see all available instances at any time.",
+      "On your first tool call it auto-connects to the only running editor, or to the editor whose project",
+      "matches this session's workspace. If it still cannot tell which editor you mean, you MUST ask the user",
+      "and call unity_select_instance before proceeding. Use unity_list_instances to see all instances at any time.",
+      "",
+      "FAILURES: a failed command reports `executed`: \"no\" means it did not run (safe to retry);",
+      "\"unknown\" means verify the editor state before retrying. unityConsole lists warnings/errors Unity logged",
+      "while the command ran. Treat them as evidence that it may not have done what you asked.",
+      "Long editor jobs have dedicated tools that report a definite state. Use them instead of polling with",
+      "execute_code (e.g. lightmaps: unity_lighting_bake / unity_lighting_bake_status via unity_advanced_tool).",
     ].join(" "),
   }
 );
+
+// ─── Workspace roots (for automatic instance selection) ───
+// Tiers, strongest first: UNITY_PROJECT_PATH, the client's MCP roots, the process cwd.
+let _clientRootsPromise = null;
+
+async function getClientRootPaths() {
+  if (!server.getClientCapabilities()?.roots) return [];
+  if (!_clientRootsPromise) {
+    _clientRootsPromise = server
+      .listRoots(undefined, { timeout: 2000 })
+      .then((result) => rootsToPaths(result.roots))
+      .catch((err) => {
+        debugLog(`roots/list failed: ${err.message}`);
+        return [];
+      });
+  }
+  return _clientRootsPromise;
+}
+
+server.setNotificationHandler(RootsListChangedNotificationSchema, async () => {
+  _clientRootsPromise = null;
+});
+
+setWorkspaceRootsProvider(async () => defaultWorkspaceRootTiers(await getClientRootPaths()));
+
+/**
+ * MCP progress notifications for long waits (queued behind a busy editor, a running bake...).
+ * Returns undefined when the client did not ask for progress (no progressToken).
+ */
+function createProgressReporter(extra, meta) {
+  const progressToken = extra?._meta?.progressToken ?? meta?.progressToken;
+  if (progressToken === undefined || typeof extra?.sendNotification !== "function") return undefined;
+  let progress = 0;
+  return (message) => {
+    progress += 1;
+    extra
+      .sendNotification({ method: "notifications/progress", params: { progressToken, progress, message } })
+      .catch(() => {});
+  };
+}
 
 // ─── List Tools Handler ───
 // Inject an optional `port` parameter into every unity_* tool schema (except
@@ -355,7 +431,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 // ─── Call Tool Handler ───
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const { name, arguments: args } = request.params;
 
   const tool = ALL_TOOLS.find((t) => t.name === name);
@@ -366,116 +442,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
 
+  // Per-request agent ID override from MCP metadata; default to the process-level ID, which is
+  // more reliable for multi-agent scheduling.
+  const meta = request.params._meta || {};
+  const agentId = meta.agentId || meta.agent_id || PROCESS_AGENT_ID;
+
+  // Per-request port (parallel-agent safe routing): when the caller names a port (argument or
+  // _meta.port), every bridge request of THIS call goes there, regardless of shared selection.
+  const portOverride = (args && typeof args.port === "number" && args.port)
+    || (typeof meta.port === "number" && meta.port)
+    || null;
+
+  const context = {
+    agentId,
+    port: portOverride,
+    signal: extra?.signal,
+    reportProgress: createProgressReporter(extra, meta),
+  };
+
   try {
-    // Allow per-request agent ID override from MCP metadata, but default to
-    // the process-level ID which is more reliable for multi-agent scheduling.
-    const meta = request.params._meta || {};
-    if (meta.agentId || meta.agent_id) {
-      const overrideId = meta.agentId || meta.agent_id;
-      setAgentId(overrideId);
-      setCurrentAgent(overrideId);
-    } else {
-      // Reset BOTH the bridge agent id and the discovery agent to this process. Without
-      // the setAgentId reset, a prior request's _meta.agentId override leaked into the
-      // X-Agent-Id header of every later request (wrong queue attribution).
-      setAgentId(PROCESS_AGENT_ID);
-      setCurrentAgent(PROCESS_AGENT_ID);
-    }
-
-    // ─── Per-request port override (parallel-agent safe routing) ───
-    // When multiple agents share this MCP process, the per-agent state can get
-    // overwritten between sequential requests. If the caller provides a `port`
-    // parameter (or _meta.port), we bypass the shared state entirely and route
-    // directly to that port for the duration of this request.
-    const portOverride = (args && typeof args.port === "number" && args.port)
-      || (meta && typeof meta.port === "number" && meta.port)
-      || null;
-
-    if (portOverride) {
-      setPortOverride(portOverride);
-      debugLog(`Port override active: ${portOverride} for tool ${name}`);
-    }
-
-    try {
-    // Auto-discover instances on first tool call (unless it's an instance tool itself)
-    // Skip auto-discovery when port override is active — the caller already knows where to route.
-    let instancePrompt = null;
-    if (!portOverride && name !== "unity_list_instances" && name !== "unity_select_instance") {
-      instancePrompt = await ensureInstanceDiscovery();
-    }
-
-    // If instance selection is required and this isn't an instance/hub tool, warn
-    // Skip this check when port override is active — the caller is explicitly routing.
-    const _selReq = !portOverride && isInstanceSelectionRequired();
-    const _selInst = getSelectedInstance();
-    debugLog(`Tool=${name}, portOverride=${portOverride || 'null'}, selectionRequired=${_selReq}, selectedPort=${_selInst?.port || 'null'}, instancePrompt=${instancePrompt ? 'SET' : 'null'}, discoveryDone=${_discoveryDonePerAgent.get(PROCESS_AGENT_ID) || false}`);
-    if (
-      _selReq &&
-      !name.startsWith("unity_hub_") &&
-      name !== "unity_list_instances" &&
-      name !== "unity_select_instance" &&
-      name !== "unity_get_project_context"
-    ) {
-      debugLog(`BLOCKING tool ${name} due to selectionRequired=true`);
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              instancePrompt ||
-              "Multiple Unity instances are running. You must call unity_list_instances and then unity_select_instance before using other Unity tools.",
-          },
-        ],
-        isError: true,
-      };
-    }
-
-    // Strip the `port` parameter before passing to the tool handler
-    // so tool implementations don't see unexpected params.
-    // Exception: unity_select_instance uses `port` as its own legitimate parameter.
-    const handlerArgs = args ? { ...args } : {};
-    if (handlerArgs.port !== undefined && name !== "unity_select_instance") {
-      delete handlerArgs.port;
-    }
-
-    const result = await tool.handler(handlerArgs);
-
-    // Build response content blocks
-    const contentBlocks = [];
-
-    // Instance info (first call only)
-    if (instancePrompt) {
-      contentBlocks.push({ type: "text", text: instancePrompt });
-    }
-
-    // Auto-inject project context on the first successful tool call
-    const contextSummary = await getContextSummaryOnce();
-    if (contextSummary) {
-      contentBlocks.push({ type: "text", text: contextSummary });
-    }
-
-    // Support content block arrays (for image-returning tools like graphics/*)
-    if (Array.isArray(result)) {
-      contentBlocks.push(...result);
-    } else {
-      contentBlocks.push({ type: "text", text: result });
-    }
-
-    // Logical failures come back as HTTP 200 payloads ({success:false}, {error}, ...)
-    // — surface them through the MCP isError flag so clients don't read them as success.
-    const response = { content: truncateResponseIfNeeded(contentBlocks) };
-    if (!Array.isArray(result) && isErrorText(result)) {
-      response.isError = true;
-    }
-    return response;
-
-    } finally {
-      // Always clear port override after request completes, even on error
-      clearPortOverride();
-    }
+    return await runWithRequestContext(context, () => executeTool(tool, name, args, portOverride));
   } catch (error) {
-    // Safety: ensure port override is always cleared, even on unexpected errors
-    clearPortOverride();
     return {
       content: [
         {
@@ -488,9 +475,84 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-// ─── MCP Resources: Expose project context files ───
+async function executeTool(tool, name, args, portOverride) {
+  // Auto-discover instances on first tool call (unless it's an instance tool itself)
+  // Skip auto-discovery when port override is active — the caller already knows where to route.
+  let instancePrompt = null;
+  if (!portOverride && name !== "unity_list_instances" && name !== "unity_select_instance") {
+    instancePrompt = await ensureInstanceDiscovery();
+  }
 
-server.setRequestHandler(ListResourcesRequestSchema, async () => {
+  // If instance selection is required and this isn't an instance/hub tool, warn
+  // Skip this check when port override is active — the caller is explicitly routing.
+  const selectionRequired = !portOverride && isInstanceSelectionRequired();
+  debugLog(`Tool=${name}, portOverride=${portOverride || 'null'}, selectionRequired=${selectionRequired}, selectedPort=${getSelectedInstance()?.port || 'null'}, instancePrompt=${instancePrompt ? 'SET' : 'null'}`);
+  if (
+    selectionRequired &&
+    !name.startsWith("unity_hub_") &&
+    name !== "unity_list_instances" &&
+    name !== "unity_select_instance" &&
+    name !== "unity_get_project_context"
+  ) {
+    debugLog(`BLOCKING tool ${name} due to selectionRequired=true`);
+    return {
+      content: [
+        {
+          type: "text",
+          text:
+            instancePrompt ||
+            "Multiple Unity instances are running. You must call unity_list_instances and then unity_select_instance before using other Unity tools.",
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  // Strip the `port` parameter before passing to the tool handler
+  // so tool implementations don't see unexpected params.
+  // Exception: unity_select_instance uses `port` as its own legitimate parameter.
+  const handlerArgs = args ? { ...args } : {};
+  if (handlerArgs.port !== undefined && name !== "unity_select_instance") {
+    delete handlerArgs.port;
+  }
+
+  const result = await tool.handler(handlerArgs);
+
+  // Build response content blocks
+  const contentBlocks = [];
+
+  // Instance info (first call only)
+  if (instancePrompt) {
+    contentBlocks.push({ type: "text", text: instancePrompt });
+  }
+
+  // Auto-inject project context on the first successful tool call
+  const contextSummary = await getContextSummaryOnce();
+  if (contextSummary) {
+    contentBlocks.push({ type: "text", text: contextSummary });
+  }
+
+  // Support content block arrays (for image-returning tools like graphics/*)
+  if (Array.isArray(result)) {
+    contentBlocks.push(...result);
+  } else {
+    contentBlocks.push({ type: "text", text: result });
+  }
+
+  // Logical failures come back as HTTP 200 payloads ({success:false}, {error}, ...)
+  // — surface them through the MCP isError flag so clients don't read them as success.
+  const response = { content: truncateResponseIfNeeded(contentBlocks) };
+  if (!Array.isArray(result) && isErrorText(result)) {
+    response.isError = true;
+  }
+  return response;
+}
+
+// ─── MCP Resources: Expose project context files ───
+// Resource reads carry this process's agent identity like tool calls do.
+const withProcessContext = (fn) => runWithRequestContext({ agentId: PROCESS_AGENT_ID }, fn);
+
+server.setRequestHandler(ListResourcesRequestSchema, () => withProcessContext(async () => {
   try {
     const contextData = await getProjectContext();
 
@@ -513,9 +575,9 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
   } catch {
     return { resources: [] };
   }
-});
+}));
 
-server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+server.setRequestHandler(ReadResourceRequestSchema, (request) => withProcessContext(async () => {
   const uri = request.params.uri;
   const match = uri.match(/^unity-context:\/\/(.+)$/);
 
@@ -539,13 +601,13 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       },
     ],
   };
-});
+}));
 
 // ─── Start Server ───
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  debugLog(`=== SERVER START === v${PACKAGE_VERSION}, agent=${PROCESS_AGENT_ID}, discoveryDone=${_discoveryDonePerAgent.get(PROCESS_AGENT_ID) || false}, selectedPort=${getSelectedInstance()?.port || 'null'}`);
+  debugLog(`=== SERVER START === v${PACKAGE_VERSION}, agent=${PROCESS_AGENT_ID}`);
   console.error(
     `Unity MCP Server running on stdio (agent: ${PROCESS_AGENT_ID})`
   );

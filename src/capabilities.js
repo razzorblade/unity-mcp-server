@@ -14,6 +14,12 @@ export const PLUGIN_FEATURES = {
   // protocolVersion 1: handshake baseline — ping advertises versions,
   // unknown routes return HTTP 404 on the legacy path.
   UNKNOWN_ROUTE_404: 1,
+  // protocolVersion 2: ping/health answered off the main thread with live editor state and a
+  // per-domain-load epoch; queue/status carries that state; queue/cancel; submit honours
+  // startTimeoutMs; tickets report Unity console output; lighting/bake* routes.
+  OFF_THREAD_HEALTH: 2,
+  QUEUE_CANCEL: 2,
+  LIGHTING_BAKE: 2,
 };
 
 /**

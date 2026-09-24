@@ -28,10 +28,30 @@ export const CONFIG = {
   portRangeEnd: parseInt(process.env.UNITY_PORT_RANGE_END || "7899"),
   instanceRegistryPath: process.env.UNITY_INSTANCE_REGISTRY || getRegistryPath(),
 
+  // Discovery / validation ping. Plugins >= protocolVersion 2 answer ping off the main thread,
+  // so this only has to cover loopback latency, not a busy editor.
+  discoveryPingTimeoutMs: parseInt(process.env.UNITY_DISCOVERY_PING_TIMEOUT || "2000"),
+
   // Queue mode polling (for async ticket-based requests)
   queuePollIntervalMs: parseInt(process.env.UNITY_QUEUE_POLL_INTERVAL || "150"),
   queuePollMaxMs: parseInt(process.env.UNITY_QUEUE_POLL_MAX || "1500"),
-  queuePollTimeoutMs: parseInt(process.env.UNITY_QUEUE_POLL_TIMEOUT || "120000"), // Max total poll time (2 min)
+  queuePollTimeoutMs: parseInt(process.env.UNITY_QUEUE_POLL_TIMEOUT || "120000"), // Max total wait per command (2 min)
+
+  // queue/submit only enqueues on the plugin (no main-thread work), so it answers in
+  // milliseconds; a submit that takes longer means the bridge is wedged. Fail fast.
+  queueSubmitTimeoutMs: parseInt(process.env.UNITY_QUEUE_SUBMIT_TIMEOUT || "10000"),
+
+  // A command still QUEUED while Unity's main thread has not ticked for this long is cancelled
+  // and reported instead of waited on (modal dialog, frozen editor, throttled MPPM session).
+  // Compiling/importing gets 3x this, since those stalls are expected to end on their own.
+  mainThreadStallTimeoutMs: parseInt(process.env.UNITY_MAIN_THREAD_STALL_TIMEOUT || "20000"),
+
+  // Routes that legitimately run longer than queuePollTimeoutMs.
+  routeTimeoutsMs: {
+    "build/start": parseInt(process.env.UNITY_BUILD_TIMEOUT || "1800000"), // 30 min
+    "packages/add": 300000,
+    "packages/remove": 300000,
+  },
 
   // Default Unity Editor path pattern (version will be interpolated)
   editorPathPattern: process.env.UNITY_EDITOR_PATH || "C:\\Program Files\\Unity\\Hub\\Editor\\{version}\\Editor\\Unity.exe",

@@ -13,9 +13,11 @@ export class McpTestClient {
    * @param {object} [options]
    * @param {object} [options.env] Extra env vars (typically MockBridge#env()).
    * @param {number} [options.timeoutMs] Per-request timeout (default 20s).
+   * @param {string} [options.cwd] Working directory for the server process (workspace affinity).
    */
   constructor(options = {}) {
     this.extraEnv = options.env || {};
+    this.cwd = options.cwd;
     this.timeoutMs = options.timeoutMs ?? 20_000;
     this._id = 0;
     /** @type {Map<number, {resolve: Function, reject: Function, timer: NodeJS.Timeout}>} */
@@ -31,6 +33,7 @@ export class McpTestClient {
   start() {
     this._child = spawn(process.execPath, [SERVER_ENTRY], {
       env: { ...process.env, ...this.extraEnv },
+      cwd: this.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -76,6 +79,16 @@ export class McpTestClient {
       this._pending.set(id, { resolve, reject, timer });
       this._child.stdin.write(payload + "\n");
     });
+  }
+
+  /**
+   * Send a tools/call without awaiting it (e.g. to cancel it mid-flight). Returns the request id.
+   * @returns {number}
+   */
+  sendToolCallNoWait(name, args = {}) {
+    const id = ++this._id;
+    this._child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }) + "\n");
+    return id;
   }
 
   notify(method, params = {}) {

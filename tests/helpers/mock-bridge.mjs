@@ -31,11 +31,18 @@ export class MockBridge {
       unityVersion: "6000.0.0f1",
       isClone: false,
       cloneIndex: -1,
-      protocolVersion: 1,
-      pluginVersion: "9.9.9-mock",
+      // A queue-less plugin predates the capability handshake, so it advertises no versions.
+      ...(this.mode === "legacy" ? {} : { protocolVersion: 2, pluginVersion: "9.9.9-mock", epoch: "mock-epoch-1" }),
       ...options.instance,
     };
     this.processingDelayMs = options.processingDelayMs ?? 0;
+    /**
+     * Simulated main-thread state reported with every queue/status (protocolVersion 2).
+     * `frozen: true` keeps tickets Queued forever, like a blocked Unity main thread.
+     */
+    this.editor = { mainThreadStallMs: 0, busy: false, busyReason: null, executing: null, frozen: false };
+    /** @type {Array<{ticketId: string, result: object}>} queue/cancel calls received */
+    this.cancels = [];
     /** @type {Map<string, (params: object) => object>} route → responder returning the plugin-side result object */
     this.routes = new Map();
     /** @type {SeenRequest[]} */
@@ -109,6 +116,21 @@ export class MockBridge {
     };
   }
 
+  /** Live editor state as the v2 plugin's MCPEditorHealth reports it. */
+  _editorSnapshot() {
+    const { frozen, ...state } = this.editor;
+    return {
+      epoch: this.instance.epoch,
+      isPlaying: false,
+      isPaused: false,
+      isCompiling: false,
+      isUpdating: false,
+      isBakingLighting: false,
+      applicationFocused: true,
+      ...state,
+    };
+  }
+
   _json(res, code, obj) {
     res.writeHead(code, { "Content-Type": "application/json" });
     res.end(JSON.stringify(obj));
@@ -120,15 +142,34 @@ export class MockBridge {
     req.on("end", () => {
       const url = new URL(req.url, `http://127.0.0.1:${this.port}`);
       const path = url.pathname.replace(/^\/api\//, "");
+      const v2 = typeof this.instance.protocolVersion === "number" && this.instance.protocolVersion >= 2;
 
-      if (path === "ping") return this._json(res, 200, this.instance);
+      if (path === "ping" || (path === "health" && v2)) {
+        return this._json(res, 200, v2 ? { ...this.instance, ...this._editorSnapshot() } : this.instance);
+      }
+
+      if (path === "queue/cancel" && req.method === "POST" && v2) {
+        const { ticketId } = JSON.parse(body || "{}");
+        const ticket = this._tickets.get(String(ticketId));
+        if (!ticket) return this._json(res, 404, { error: "Ticket not found" });
+        let result;
+        if (ticket.status === "Queued") {
+          ticket.status = "Cancelled";
+          ticket.errorMessage = "Cancelled by the client before it started — the command did NOT run.";
+          result = { ticketId, cancelled: true, status: "Cancelled" };
+        } else {
+          result = { ticketId, cancelled: false, status: ticket.status };
+        }
+        this.cancels.push({ ticketId, result });
+        return this._json(res, 200, result);
+      }
 
       if (path === "queue/submit" && req.method === "POST") {
         if (this.mode === "legacy") return this._json(res, 404, { error: "Unknown route" });
         const payload = JSON.parse(body || "{}");
         const route = String(payload.apiPath || "").replace(/^\/?api\//, "").replace(/^\//, "");
         const params = payload.body ? JSON.parse(payload.body) : {};
-        this.seen.push({ route, params, headers: req.headers, via: "queue" });
+        this.seen.push({ route, params, headers: req.headers, via: "queue", startTimeoutMs: payload.startTimeoutMs });
         const ticketId = `ticket-${++this._ticketCounter}`;
         // Field names mirror the plugin's MCPRequestQueue.TicketToDict EXACTLY. The failure
         // text lives in `errorMessage` — the mock previously emitted `error`, which is why a
@@ -136,8 +177,16 @@ export class MockBridge {
         const ticket = { ticketId, status: "Queued", agentId: payload.agentId || "unknown", result: null, errorMessage: "" };
         this._tickets.set(ticketId, ticket);
         const complete = () => {
+          // A frozen main thread never dequeues anything: the ticket stays Queued.
+          if (this.editor.frozen) return;
+          if (ticket.status === "Cancelled") return;
           try {
-            const outcome = this._resolve(route, params);
+            let outcome = this._resolve(route, params);
+            if (outcome && outcome.__logs) {
+              // Unity console output captured while the command ran (plugin TicketToDict "logs").
+              ticket.logs = outcome.__logs;
+              outcome = outcome.__result;
+            }
             if (outcome && outcome.__fail) {
               ticket.status = "Failed";
               ticket.errorMessage = outcome.error || "Mock failure";
@@ -159,13 +208,15 @@ export class MockBridge {
           }
         };
         this.processingDelayMs > 0 ? setTimeout(complete, this.processingDelayMs) : complete();
-        return this._json(res, 202, { ticketId, status: "Queued", position: this._tickets.size });
+        const accepted = { ticketId, status: "Queued", position: this._tickets.size };
+        if (v2) accepted.epoch = this.instance.epoch;
+        return this._json(res, 202, accepted);
       }
 
       if (path === "queue/status") {
         const ticket = this._tickets.get(url.searchParams.get("ticketId"));
-        if (!ticket) return this._json(res, 404, { error: "Ticket not found" });
-        return this._json(res, 200, ticket);
+        if (!ticket) return this._json(res, 404, v2 ? { error: "Ticket not found", epoch: this.instance.epoch } : { error: "Ticket not found" });
+        return this._json(res, 200, v2 ? { ...ticket, editor: this._editorSnapshot() } : ticket);
       }
 
       if (path === "queue/info") {

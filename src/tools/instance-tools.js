@@ -5,16 +5,16 @@ import {
   discoverInstances,
   selectInstance,
   getSelectedInstance,
-  autoSelectInstance,
 } from "../instance-discovery.js";
+import { isVirtualPlayerInstance } from "../workspace-affinity.js";
 import { formatResult } from "../response-format.js";
 
 export const instanceTools = [
   {
     name: "unity_list_instances",
     description:
-      "List running Unity Editor instances (name, port, version, clone flag, pluginVersion). " +
-      "With multiple instances, select one with unity_select_instance next.",
+      "List running Unity Editor instances (name, port, path, version, clone/virtual-player flags, busy state). " +
+      "With multiple editors and no automatic workspace match, select one with unity_select_instance next.",
     inputSchema: {
       type: "object",
       properties: {
@@ -25,7 +25,7 @@ export const instanceTools = [
         },
       },
     },
-    handler: async ({ refresh = true } = {}) => {
+    handler: async () => {
       const instances = await discoverInstances();
       const selected = getSelectedInstance();
 
@@ -37,9 +37,13 @@ export const instanceTools = [
           unityVersion: inst.unityVersion,
           isClone: inst.isClone,
           cloneIndex: inst.cloneIndex,
+          isVirtualPlayer: isVirtualPlayerInstance(inst),
           pluginVersion: inst.pluginVersion,
           source: inst.source,
           isSelected: selected ? selected.port === inst.port : false,
+          // Live state from discovery's off-main-thread ping (plugins >= 2.40): a busy editor
+          // still lists, with the reason it is busy.
+          ...(inst.live ? { state: inst.live } : {}),
         })),
         totalCount: instances.length,
         selectedPort: selected?.port || null,
@@ -89,10 +93,13 @@ export const instanceTools = [
       }
 
       // Resolve a project name to its current port (names are stable, ports are not).
+      // MPPM Virtual Players share their editor's name; they only match when nothing else does.
       if (!port) {
         const instances = await discoverInstances();
         const needle = projectName.toLowerCase();
-        const matches = instances.filter((i) => (i.projectName || "").toLowerCase() === needle);
+        const named = instances.filter((i) => (i.projectName || "").toLowerCase() === needle);
+        const editors = named.filter((i) => !isVirtualPlayerInstance(i));
+        const matches = editors.length > 0 ? editors : named;
         if (matches.length === 0) {
           return formatResult({
             success: false,

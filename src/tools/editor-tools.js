@@ -2,6 +2,65 @@
 import * as bridge from "../unity-editor-bridge.js";
 import { formatResult, looksLikeErrorObject } from "../response-format.js";
 import { isUnknownRouteResult } from "../capabilities.js";
+import { delay, isRequestCancelled } from "../request-context.js";
+
+const BAKE_STATUS_POLL_MS = 2000;
+const BAKE_DEFAULT_WAIT_SECONDS = 60;
+const BAKE_MAX_WAIT_SECONDS = 1800;
+
+/**
+ * Start a lightmap bake and (optionally) wait for it server-side, so the agent never has to
+ * write its own polling loop. The plugin verifies the bake actually started and its status is
+ * an explicit state machine (Running/Completed/Failed/Cancelled/Idle), so waiting always ends.
+ */
+async function bakeLighting({ clearFirst, waitSeconds } = {}) {
+  const start = await bridge.sendCommand("lighting/bake", clearFirst === true ? { clearFirst: true } : {});
+  const startData = start?.data;
+  if (!start?.success || !startData || startData.success === false) return formatResult(start);
+
+  const waitMs = Math.min(Math.max(Number(waitSeconds ?? BAKE_DEFAULT_WAIT_SECONDS) || 0, 0), BAKE_MAX_WAIT_SECONDS) * 1000;
+  const base = {
+    started: startData.started === true,
+    alreadyRunning: startData.alreadyRunning === true || undefined,
+    settings: startData.settings,
+    hints: startData.hints?.length ? startData.hints : undefined,
+    unityConsole: start.unityConsole,
+  };
+  if (waitMs === 0) return formatResult({ success: true, ...base, bake: startData.status, next: startData.next });
+
+  const deadline = Date.now() + waitMs;
+  let status = startData.status;
+  while (!isRequestCancelled()) {
+    await delay(Math.min(BAKE_STATUS_POLL_MS, Math.max(0, deadline - Date.now())));
+    if (isRequestCancelled()) break;
+    const res = await bridge.sendCommand("lighting/bake-status", {}, { timeoutMs: 15000 });
+    if (!res?.success || !res.data) {
+      return formatResult({ ...res, ...base, note: "The bake was started, but its status could not be read." });
+    }
+    status = res.data;
+    const pct = Math.round((status.progress || 0) * 100);
+    bridge.reportProgress(`Baking lighting: ${pct}% (${status.elapsedSeconds ?? "?"}s)`);
+    if (status.state !== "Running" || Date.now() >= deadline) break;
+  }
+
+  if (status?.state === "Failed" || status?.state === "Cancelled") {
+    return formatResult({
+      success: false,
+      ...base,
+      error: `Lightmap bake ${status.state.toLowerCase()}. ${status.hint || ""}`.trim(),
+      bake: status,
+    });
+  }
+  const stillRunning = status?.state === "Running";
+  return formatResult({
+    success: true,
+    ...base,
+    bake: status,
+    note: stillRunning
+      ? `Still baking after ${Math.round(waitMs / 1000)}s. Check later with unity_lighting_bake_status (do not start another bake).`
+      : undefined,
+  });
+}
 
 // Shared shaping for image-returning graphics tools.
 // The bridge wraps plugin payloads as { success, data: { ..., base64 } } (queue mode)
@@ -64,7 +123,9 @@ export const editorTools = [
   // â”€â”€â”€ Connection â”€â”€â”€
   {
     name: "unity_editor_ping",
-    description: "Check if the Unity Editor bridge is running and responsive. Returns editor version, project name, and connection status.",
+    description:
+      "Check if the Unity Editor bridge is running and responsive. Returns editor version, project name, connection status, and " +
+      "(plugin 2.40+) live state that answers even while Unity is busy: busy/busyReason, mainThreadStallMs, isPlaying, isCompiling.",
     inputSchema: { type: "object", properties: {} },
     handler: async () => formatResult(await bridge.ping()),
   },
@@ -1590,6 +1651,50 @@ export const editorTools = [
       },
     },
     handler: async (params) => formatResult(await bridge.createLightProbeGroup(params)),
+  },
+  {
+    name: "unity_lighting_bake",
+    description:
+      "Bake (or rebake) lightmaps / global illumination (GI) for the open scene(s). Use this instead of execute_code or menu items. " +
+      "It fails fast with the reason when Unity cannot bake (Play mode, unsaved scene, compiling) and verifies the bake really started. " +
+      "By default it waits up to waitSeconds (60) with progress and returns the final state: Completed, Failed, Cancelled, or Running if still going.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        clearFirst: { type: "boolean", description: "Clear existing baked data before baking (default false)." },
+        waitSeconds: {
+          type: "number",
+          description: "How long to wait for the bake to finish (default 60, max 1800). 0 = start and return immediately.",
+        },
+      },
+    },
+    handler: bakeLighting,
+  },
+  {
+    name: "unity_lighting_bake_status",
+    description:
+      "Lightmap bake state: Idle (nothing started), Running (with progress 0-1), Completed, Failed, or Cancelled, plus warnings/errors " +
+      "the lightmapper logged. Only Running means it is worth checking again.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => formatResult(await bridge.sendCommand("lighting/bake-status", {})),
+  },
+  {
+    name: "unity_lighting_bake_cancel",
+    description: "Cancel a running lightmap bake.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => formatResult(await bridge.sendCommand("lighting/bake-cancel", {})),
+  },
+  {
+    name: "unity_lighting_clear_baked",
+    description: "Clear baked lightmap data for the open scene(s) (Lighting window > Clear Baked Data).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        clearDiskCache: { type: "boolean", description: "Also clear the GI disk cache (default false)." },
+      },
+    },
+    handler: async ({ clearDiskCache } = {}) =>
+      formatResult(await bridge.sendCommand("lighting/clear-baked", clearDiskCache === true ? { clearDiskCache: true } : {})),
   },
 
   // â”€â”€â”€ Audio â”€â”€â”€

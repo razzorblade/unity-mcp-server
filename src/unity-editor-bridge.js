@@ -1,381 +1,492 @@
 // Unity Editor HTTP Bridge Client
-// Communicates with the C# plugin running inside Unity Editor
-// Supports both queue mode (async ticket-based) and legacy sync mode
+// Communicates with the C# plugin running inside Unity Editor.
+// Queue mode (async, ticket-based) with a legacy synchronous fallback for pre-queue plugins.
+//
+// Failure-reporting contract: every failed command resolves (never hangs) within its deadline
+// with { success: false, error, executed } where `executed` tells the caller what happened
+// inside Unity:
+//   "no"      — the command never ran (not delivered, cancelled or dropped before starting): safe to retry.
+//   "unknown" — it may have run (still executing, or lost to a domain reload): verify before retrying.
+// Failures raised BY the command itself (exceptions, validation) carry no `executed` field.
 import { CONFIG } from "./config.js";
-import { getActiveBridgeUrl } from "./instance-discovery.js";
+import { getActiveBridgeUrl, getActiveInstance } from "./instance-discovery.js";
+import { getRequestContext, isRequestCancelled as isClientCancelled, delay as sleep } from "./request-context.js";
+import { pluginSupports } from "./capabilities.js";
 
-// Dynamic bridge URL â€" resolved per-call based on selected instance
+// Dynamic bridge URL — resolved per call from the request context / selected instance.
 function getBridgeUrl() {
   return getActiveBridgeUrl();
 }
 
-// Agent identity â€" tracks which AI agent is making requests
-let _currentAgentId = "default";
-
-// Mode detection â€" cached to avoid repeated 404 checks
-let _useQueueMode = true;
-let _queueModeDetermined = false;
-
-/**
- * Set the current agent ID. All subsequent sendCommand calls include this as X-Agent-Id header.
- */
-export function setAgentId(agentId) {
-  _currentAgentId = agentId || "default";
+function currentAgentId() {
+  return getRequestContext().agentId;
 }
 
-// Retry settings â€" handles Unity domain reloads (1-3 sec server downtime)
-const MAX_RETRIES = 4;
-const RETRY_BASE_DELAY_MS = 800; // 800ms, 1600ms, 3200ms, 6400ms
+// Bridges known to lack the queue endpoints (pre-queue plugins), keyed by base URL — several
+// editors with different plugin versions can be served at once.
+const _legacyBridges = new Set();
 
-/**
- * Sleep helper for retry backoff
- */
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+// Backoff for connection-level failures: covers the bridge restart after a domain reload
+// (~1-3s) without turning a closed editor into a multi-minute wait.
+const CONNECT_RETRY_DELAYS_MS = [500, 1000, 2000, 4000];
+
+const STATUS_POLL_REQUEST_TIMEOUT_MS = 10_000;
+const CANCEL_REQUEST_TIMEOUT_MS = 3_000;
+const MAX_STATUS_404_GRACE = 5; // dequeue→execute race window on plugins without an epoch
+const PROGRESS_INTERVAL_MS = 2_000;
+
+/** The request never reached Unity: nothing accepted the connection. Safe to retry. */
+function isConnectionError(error) {
+  const code = error?.cause?.code || error?.code;
+  return (
+    code === "ECONNREFUSED" ||
+    code === "ECONNRESET" ||
+    code === "EPIPE" ||
+    code === "UND_ERR_SOCKET" ||
+    /ECONNREFUSED|ECONNRESET/.test(error?.message || "") ||
+    (error?.message === "fetch failed" && !isTimeoutError(error?.cause))
+  );
 }
 
-/**
- * Returns true if the error looks like a transient connection issue
- * (server temporarily down during Unity domain reload).
- */
-function isTransientError(error, response) {
-  if (error) {
-    // Connection refused / reset / aborted â€" server is restarting
-    const msg = error.message || "";
-    return (
-      error.code === "ECONNREFUSED" ||
-      error.code === "ECONNRESET" ||
-      msg.includes("ECONNREFUSED") ||
-      msg.includes("ECONNRESET") ||
-      msg.includes("fetch failed") ||
-      error.name === "AbortError"
-    );
-  }
-  // HTTP 500/503 during domain reload (server half-alive)
-  if (response && (response.status === 503 || response.status === 500)) {
-    return true;
-  }
-  return false;
+function isTimeoutError(error) {
+  return error?.name === "TimeoutError" || error?.name === "AbortError";
+}
+
+/** Per-request signal: our own timeout, plus the client's cancellation where supported. */
+function requestSignal(timeoutMs, { ignoreClientCancel = false } = {}) {
+  const timeout = AbortSignal.timeout(Math.max(1, timeoutMs));
+  const clientSignal = ignoreClientCancel ? null : getRequestContext().signal;
+  if (!clientSignal || typeof AbortSignal.any !== "function") return timeout; // Node 18: polls still stop between requests
+  return AbortSignal.any([clientSignal, timeout]);
 }
 
 /**
- * Submit a command to the queue and get a ticket ID.
- * POST /api/queue/submit with {apiPath, method, body, agentId}
+ * One HTTP exchange with the bridge. Resolves with the parsed body for ANY HTTP status;
+ * rejects only on transport failure (refused, reset, timeout, cancelled).
  */
-async function submitToQueue(apiPath, bodyString) {
-  const url = `${getBridgeUrl()}/api/queue/submit`;
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Agent-Id": _currentAgentId,
-    },
-    body: JSON.stringify({
-      apiPath,
-      method: "POST",
-      body: bodyString,
-      agentId: _currentAgentId,
-    }),
-    signal: AbortSignal.timeout(CONFIG.editorBridgeTimeout),
+async function bridgeFetch(path, { method = "GET", body, timeoutMs, ignoreClientCancel = false } = {}) {
+  const headers = { "X-Agent-Id": currentAgentId() };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  const response = await fetch(`${getBridgeUrl()}${path}`, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: requestSignal(timeoutMs, { ignoreClientCancel }),
   });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`HTTP ${response.status}: ${text}`);
+  const text = await response.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    // Non-JSON body (proxy/OS error page) — callers use `text`.
   }
-
-  const data = await response.json();
-  return data; // { ticketId, queuePosition, ... }
+  return { status: response.status, ok: response.ok, data, text };
 }
 
-/**
- * Poll the queue status for a ticket until completion.
- * GET /api/queue/status?ticketId=X
- */
-async function pollQueueStatus(ticketId) {
-  let pollIntervalMs = CONFIG.queuePollIntervalMs;
-  // Cap the growth of the poll interval at the configured max (default 1500ms). This used
-  // to be Math.min(1000, ...), which silently clamped the documented UNITY_QUEUE_POLL_MAX
-  // and the default to 1000.
-  const maxIntervalMs = CONFIG.queuePollMaxMs;
-  const startTime = Date.now();
-  // Use dedicated poll timeout (longer than bridge timeout to handle slow operations like execute_code)
-  const timeoutMs = CONFIG.queuePollTimeoutMs || CONFIG.editorBridgeTimeout;
-  let consecutive404s = 0;
-  let consecutiveTransient = 0;
-  const max404Grace = 5; // Allow a few 404s during the dequeueâ†'execute race window
-
-  while (true) {
-    // Check timeout
-    if (Date.now() - startTime > timeoutMs) {
-      return {
-        success: false,
-        error: `Queue polling timed out after ${timeoutMs}ms for ticket ${ticketId}`,
-      };
-    }
-
-    // Poll status
-    try {
-      const url = `${getBridgeUrl()}/api/queue/status?ticketId=${ticketId}`;
-      const response = await fetch(url, {
-        method: "GET",
-        headers: {
-          "X-Agent-Id": _currentAgentId,
-        },
-        signal: AbortSignal.timeout(10000), // 10s per individual poll request
-      });
-
-      if (!response.ok) {
-        // Grace period for 404 â€" ticket may be between dequeue and execution tracking
-        if (response.status === 404) {
-          consecutive404s++;
-          if (consecutive404s < max404Grace) {
-            await sleep(pollIntervalMs);
-            pollIntervalMs = Math.min(Math.ceil(pollIntervalMs * 1.5), maxIntervalMs);
-            continue;
-          }
-        }
-        const text = await response.text();
-        return {
-          success: false,
-          error: `Failed to poll queue status: HTTP ${response.status}: ${text}`,
-        };
-      }
-
-      // Reset the 404 and transient-error counters on any successful poll response.
-      consecutive404s = 0;
-      consecutiveTransient = 0;
-
-      const statusData = await response.json();
-
-      // Check completion status
-      if (statusData.status === "Completed") {
-        // Extract result — explicit undefined check so falsy results (null, 0, false, "") pass
-        // through. A ticket with NO result field completes with a minimal status object;
-        // returning the whole ticket here used to leak queue metadata into tool output.
-        return {
-          success: true,
-          data: statusData.result !== undefined ? statusData.result : { status: "Completed" },
-        };
-      } else if (statusData.status === "Failed") {
-        // The queue ticket carries the Unity-side exception in `errorMessage`
-        // (MCPRequestQueue.TicketToDict) — reading only `error` here silently discarded
-        // EVERY real diagnostic and returned the generic fallback for all routes, which
-        // pushed agents into retrying non-idempotent writes blind. `error` is still
-        // accepted for the legacy synchronous shape.
-        return {
-          success: false,
-          error: statusData.errorMessage || statusData.error || "Queue processing failed",
-        };
-      } else if (statusData.status === "TimedOut") {
-        // Terminal on the plugin side — surface it now instead of polling a doomed ticket
-        // until it's evicted (which then reads back as a misleading 404 ~30-60s later).
-        return {
-          success: false,
-          error:
-            statusData.errorMessage ||
-            statusData.error ||
-            `Unity-side execution timed out for ticket ${ticketId}`,
-        };
-      }
-
-      // Still processing â€" wait before polling again
-      await sleep(pollIntervalMs);
-
-      // Increase poll interval up to max
-      pollIntervalMs = Math.min(
-        Math.ceil(pollIntervalMs * 1.5),
-        maxIntervalMs
-      );
-    } catch (error) {
-      // A transient poll failure (ECONNRESET/"fetch failed"/AbortError) commonly happens
-      // when the command triggered a domain reload that briefly drops the bridge — Unity
-      // still finishes the ticket. Failing here made the client retry a NON-idempotent
-      // command that already ran (duplicate GameObject, double package add). Keep polling
-      // through transient errors until the deadline; only give up on a non-transient one.
-      if (isTransientError(error, null)) {
-        consecutiveTransient++;
-        console.error(
-          `[MCP Bridge] Transient poll error for ticket ${ticketId} (${error.message}), retrying (${consecutiveTransient})...`
-        );
-        await sleep(pollIntervalMs);
-        pollIntervalMs = Math.min(Math.ceil(pollIntervalMs * 1.5), maxIntervalMs);
-        continue;
-      }
-      return {
-        success: false,
-        error: `Error polling queue: ${error.message}`,
-      };
-    }
-  }
+function unreachableHint() {
+  return (
+    `The Unity bridge at ${getBridgeUrl()} is not answering. Unity may be closed, in the middle of a domain reload, ` +
+    "or its MCP bridge is stopped (Window > AB Unity MCP > Dashboard). unity_list_instances shows which editors are reachable."
+  );
 }
 
-/**
- * Send command via legacy sync mode (direct POST).
- * Falls back to the original implementation.
- */
-async function sendCommandLegacyMode(command, params = {}) {
-  const url = `${getBridgeUrl()}/api/${command}`;
-  let lastError = null;
-
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), CONFIG.editorBridgeTimeout);
-
-    try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Agent-Id": _currentAgentId,
-        },
-        body: JSON.stringify(params),
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
-
-      // Transient server error â€" retry
-      if (isTransientError(null, response) && attempt < MAX_RETRIES) {
-        const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
-        console.error(
-          `[MCP Bridge] HTTP ${response.status} on ${command}, retrying in ${delay}ms (${attempt + 1}/${MAX_RETRIES})...`
-        );
-        await sleep(delay);
-        continue;
-      }
-
-      if (!response.ok) {
-        const text = await response.text();
-        return { success: false, error: `HTTP ${response.status}: ${text}` };
-      }
-
-      const data = await response.json();
-
-      // If we retried, log that we recovered
-      if (attempt > 0) {
-        console.error(
-          `[MCP Bridge] Recovered after ${attempt} retries for ${command}`
-        );
-      }
-
-      return { success: true, data };
-    } catch (error) {
-      clearTimeout(timeout);
-      lastError = error;
-
-      // Transient connection error â€" retry with backoff
-      if (isTransientError(error, null) && attempt < MAX_RETRIES) {
-        const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
-        console.error(
-          `[MCP Bridge] ${error.code || error.name || "Error"} on ${command}, retrying in ${delay}ms (${attempt + 1}/${MAX_RETRIES})...`
-        );
-        await sleep(delay);
-        continue;
-      }
-    }
-  }
-
-  // All retries exhausted
-  if (lastError?.name === "AbortError") {
-    return {
-      success: false,
-      error:
-        "Request timed out after retries. Unity Editor may be in a long domain reload or not running.",
-    };
-  }
+/** Compact editor state for error payloads (from a v2 plugin's queue/status). */
+function summarizeEditor(editor) {
+  if (!editor) return undefined;
   return {
-    success: false,
-    error: `Connection failed after ${MAX_RETRIES} retries: ${lastError?.message}. Unity Editor may be reloading or not running.`,
+    busyReason: editor.busyReason ?? null,
+    mainThreadStallMs: editor.mainThreadStallMs,
+    isPlaying: editor.isPlaying,
+    isCompiling: editor.isCompiling,
+    applicationFocused: editor.applicationFocused,
   };
 }
 
 /**
- * Send a command to the Unity Editor bridge.
- * Tries queue mode first (async ticket-based), falls back to legacy sync mode if 404.
- * Automatically retries on transient failures (e.g. Unity domain reload)
- * with exponential backoff so multi-agent workflows stay resilient.
+ * Attach what Unity logged while the command ran. A call can "succeed" at the API level while
+ * Unity logs why it didn't do what was asked, and that log is often the only evidence.
  */
-export async function sendCommand(command, params = {}) {
-  const bodyString = JSON.stringify(params);
-
-  // If we've determined the plugin doesn't support queue mode, use legacy
-  if (_queueModeDetermined && !_useQueueMode) {
-    return sendCommandLegacyMode(command, params);
+function withUnityLogs(result, logs) {
+  if (!Array.isArray(logs) || logs.length === 0) return result;
+  result.unityConsole = logs;
+  if (result.success && logs.some((l) => l.type === "Error" || l.type === "Exception" || l.type === "Assert")) {
+    result.warning = "Unity logged errors while this command ran. Check unityConsole before assuming it worked.";
   }
+  return result;
+}
 
-  // Try queue mode (if not yet determined it's unavailable)
-  if (!_queueModeDetermined || _useQueueMode) {
+/**
+ * Commands safe to resubmit automatically when their ticket is lost to a domain reload.
+ * Stricter than the plugin's read batching: only unmistakable queries qualify.
+ */
+function isReadOnlyCommand(route) {
+  const r = String(route).toLowerCase();
+  return (
+    r === "ping" ||
+    r === "_meta/routes" ||
+    r === "scene/hierarchy" ||
+    r === "editor/state" ||
+    r === "console/log" ||
+    r === "compilation/errors" ||
+    r.startsWith("search/") ||
+    /\/(info|list|stats|get|status)$/.test(r) ||
+    /-status$/.test(r) ||
+    /\/get-[a-z-]+$/.test(r)
+  );
+}
+
+/** Progress notification, throttled by the caller. */
+export function reportProgress(message) {
+  try {
+    getRequestContext().reportProgress?.(message);
+  } catch {
+    // Progress is best-effort; never fail a command over it.
+  }
+}
+
+// ─── Queue submit ───
+
+/**
+ * POST /api/queue/submit. Retries only when the connection itself failed (the request never
+ * reached Unity), within the command deadline.
+ * @returns {Promise<{ticket?: object, unsupported?: boolean, error?: string, executed?: string}>}
+ */
+async function submitTicket(command, bodyString, deadline) {
+  for (let attempt = 0; ; attempt++) {
+    const remaining = deadline - Date.now();
     try {
-      // Submit to queue with retry logic
-      let submitLastError = null;
-      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-        try {
-          const ticketData = await submitToQueue(command, bodyString);
-          const ticketId = ticketData.ticketId;
-
-          // Log to stderr, not stdout — stdout is reserved for the MCP JSON-RPC
-          // transport and any non-JSON data there closes strict clients (e.g. Codex).
-          console.error(`[MCP Bridge] Submitted ${command} to queue, ticket: ${ticketId}`);
-
-          // Poll for completion
-          const result = await pollQueueStatus(ticketId);
-
-          // Queue submission succeeded (we got a ticket), so queue mode is confirmed
-          _queueModeDetermined = true;
-          _useQueueMode = true;
-          return result;
-        } catch (submitError) {
-          submitLastError = submitError;
-
-          // Check if it's a transient error worth retrying
-          if (isTransientError(submitError, null) && attempt < MAX_RETRIES) {
-            const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
-            console.error(
-              `[MCP Bridge] Error submitting to queue: ${submitError.message}, retrying in ${delay}ms (${attempt + 1}/${MAX_RETRIES})...`
-            );
-            await sleep(delay);
-            continue;
-          }
-
-          // Check if it's a 404 (queue not supported) â€" match "HTTP 404" or raw status code
-          if (submitError.status === 404 || (submitError.message && /HTTP\s*404/.test(submitError.message))) {
-            console.warn(
-              `[MCP Bridge] Queue mode not supported (HTTP 404), falling back to legacy sync mode`
-            );
-            _queueModeDetermined = true;
-            _useQueueMode = false;
-            return sendCommandLegacyMode(command, params);
-          }
-
-          // Other errors â€" don't retry, mark mode as undetermined and try legacy
-          break;
-        }
-      }
-
-      // If we get here, queue submit failed after retries
-      if (submitLastError) {
-        // A TRANSIENT failure (editor not up yet, domain reload longer than the retry window,
-        // connection reset) is NOT evidence the plugin lacks queue mode — only the HTTP 404
-        // above is. Latching here downgraded the session permanently and irreversibly: legacy
-        // mode loses agent attribution, per-action undo grouping and read-batching, and nothing
-        // ever reset the flags. Fall back for THIS call, leave the mode undetermined so the
-        // next call re-probes.
-        console.warn(
-          `[MCP Bridge] Queue submit failed after retries, using legacy sync for this call (mode left undetermined): ${submitLastError.message}`
-        );
-        return sendCommandLegacyMode(command, params);
-      }
+      const res = await bridgeFetch("/api/queue/submit", {
+        method: "POST",
+        body: {
+          apiPath: command,
+          method: "POST",
+          body: bodyString,
+          agentId: currentAgentId(),
+          // v2 plugins drop the ticket unexecuted if it can't START before we stop waiting.
+          startTimeoutMs: Math.max(1000, remaining),
+        },
+        timeoutMs: Math.min(CONFIG.queueSubmitTimeoutMs, Math.max(1000, remaining)),
+      });
+      if (res.status === 404) return { unsupported: true };
+      if (!res.ok) return { error: `HTTP ${res.status}: ${res.text}`, executed: "no" };
+      return { ticket: res.data || {} };
     } catch (error) {
-      console.warn(
-        `[MCP Bridge] Unexpected error in queue mode, using legacy sync for this call (mode left undetermined): ${error.message}`
-      );
-      return sendCommandLegacyMode(command, params);
+      if (isClientCancelled()) return { error: "Cancelled by the MCP client before Unity received the command.", executed: "no" };
+      const delay = CONNECT_RETRY_DELAYS_MS[attempt];
+      if (isConnectionError(error) && delay !== undefined && Date.now() + delay < deadline) {
+        console.error(`[MCP Bridge] ${error.cause?.code || error.message} submitting ${command}, retrying in ${delay}ms...`);
+        await sleep(delay);
+        continue;
+      }
+      if (isTimeoutError(error)) {
+        return {
+          error: `Unity did not accept the command within ${Math.round(CONFIG.queueSubmitTimeoutMs / 1000)}s (the bridge is unresponsive).`,
+          executed: "unknown",
+        };
+      }
+      return { error: `Could not deliver the command to Unity (${error.cause?.code || error.message}). ${unreachableHint()}`, executed: "no" };
     }
   }
+}
 
-  // Fallback (should not reach here, but just in case)
-  return sendCommandLegacyMode(command, params);
+// ─── Queue cancel ───
+
+/**
+ * Ask the plugin to drop a ticket that has not started. Sent even after the client cancelled
+ * (that is exactly when it matters). Returns the plugin's answer, or null if it had none.
+ */
+async function cancelTicket(ticketId) {
+  const instance = getActiveInstance();
+  if (instance && typeof instance.protocolVersion === "number" && !pluginSupports(instance, "QUEUE_CANCEL")) return null;
+  try {
+    const res = await bridgeFetch("/api/queue/cancel", {
+      method: "POST",
+      body: { ticketId },
+      timeoutMs: CANCEL_REQUEST_TIMEOUT_MS,
+      ignoreClientCancel: true,
+    });
+    return res.ok ? res.data : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Stop waiting on a ticket and tell the caller precisely what happened to it.
+ * @returns {Promise<object>} A failed result, or the real result if the ticket finished meanwhile.
+ */
+async function abandonTicket(ticketId, reason, editor) {
+  const cancel = await cancelTicket(ticketId);
+  const base = { success: false, ticketId, editor: summarizeEditor(editor) };
+
+  if (cancel?.cancelled === true) {
+    return {
+      ...base,
+      error: `${reason} The command was cancelled before it started. It did NOT run, so it is safe to retry once the editor responds.`,
+      executed: "no",
+    };
+  }
+  if (cancel && (cancel.status === "Completed" || cancel.status === "Failed")) {
+    // Finished in the meantime: report the real outcome instead of a false failure.
+    try {
+      const res = await bridgeFetch(`/api/queue/status?ticketId=${ticketId}`, {
+        timeoutMs: CANCEL_REQUEST_TIMEOUT_MS,
+        ignoreClientCancel: true,
+      });
+      if (res.ok && res.data) return terminalResult(res.data);
+    } catch {
+      // Fall through to the generic message.
+    }
+  }
+  if (cancel?.status === "Executing") {
+    return {
+      ...base,
+      error: `${reason} The command is still executing inside Unity and its outcome is unknown. Check the editor state before retrying.`,
+      executed: "unknown",
+    };
+  }
+  return {
+    ...base,
+    error:
+      `${reason} Cancellation could not be confirmed. If the command had not started, the plugin drops it once its start ` +
+      "deadline passes (plugin 2.40+). Check the editor state before retrying.",
+    executed: "unknown",
+  };
+}
+
+/** Map a terminal ticket to a command result, or null if the ticket isn't terminal yet. */
+function terminalResult(ticket) {
+  switch (ticket.status) {
+    case "Completed":
+      // Explicit undefined check so falsy results (null, 0, false, "") pass through. A ticket with
+      // NO result field completes with a minimal status object (never leak queue metadata).
+      return withUnityLogs(
+        { success: true, data: ticket.result !== undefined ? ticket.result : { status: "Completed" } },
+        ticket.logs
+      );
+    case "Failed":
+      // The plugin carries the Unity-side exception in `errorMessage`; `error` is the legacy shape.
+      return withUnityLogs({ success: false, error: ticket.errorMessage || ticket.error || "Queue processing failed" }, ticket.logs);
+    case "TimedOut": {
+      const error = ticket.errorMessage || ticket.error || `Unity-side execution timed out for ticket ${ticket.ticketId}`;
+      return { success: false, error, executed: /WITHOUT running/i.test(error) ? "no" : "unknown" };
+    }
+    case "Cancelled":
+      return { success: false, error: ticket.errorMessage || "Cancelled before it started. The command did NOT run.", executed: "no" };
+    default:
+      return null;
+  }
+}
+
+// ─── Queue polling ───
+
+/**
+ * Wait for a ticket's result. Returns within the deadline with either the result or a precise
+ * failure: a command stuck behind a frozen main thread is cancelled and reported instead of
+ * waited on, and a client cancellation cancels the ticket too.
+ */
+async function awaitTicket(ticketId, { command, deadline, submitEpoch }) {
+  let pollIntervalMs = CONFIG.queuePollIntervalMs;
+  const startedAt = Date.now();
+  let lastStatus = "Queued";
+  let lastEditor = null;
+  let consecutive404s = 0;
+  let lastProgressAt = 0;
+  let lastProgressKey = "";
+
+  const elapsedSec = () => Math.round((Date.now() - startedAt) / 1000);
+  const progress = (key, message) => {
+    const now = Date.now();
+    if (key !== lastProgressKey || now - lastProgressAt >= PROGRESS_INTERVAL_MS) {
+      lastProgressKey = key;
+      lastProgressAt = now;
+      reportProgress(message);
+    }
+  };
+  const backoff = async () => {
+    await sleep(pollIntervalMs);
+    // Cap the growth at the configured max (UNITY_QUEUE_POLL_MAX).
+    pollIntervalMs = Math.min(Math.ceil(pollIntervalMs * 1.5), CONFIG.queuePollMaxMs);
+  };
+
+  while (true) {
+    if (isClientCancelled()) {
+      return abandonTicket(ticketId, "Cancelled by the MCP client.", lastEditor);
+    }
+    if (Date.now() >= deadline) {
+      const where = lastStatus === "Executing" ? "still executing" : "still waiting to start";
+      return abandonTicket(ticketId, `No result from Unity after ${elapsedSec()}s (${where}).`, lastEditor);
+    }
+
+    let res;
+    try {
+      res = await bridgeFetch(`/api/queue/status?ticketId=${ticketId}`, {
+        timeoutMs: Math.min(STATUS_POLL_REQUEST_TIMEOUT_MS, Math.max(1000, deadline - Date.now())),
+      });
+    } catch (error) {
+      if (isClientCancelled()) continue;
+      if (isConnectionError(error) || isTimeoutError(error)) {
+        // Bridge briefly down: usually a domain reload triggered by (or during) this command.
+        // Unity may still finish it, so keep polling until the deadline instead of failing a
+        // command that ran (retrying a non-idempotent write would duplicate it).
+        progress("unreachable", `Unity bridge unreachable for now (likely a domain reload). Waiting (${elapsedSec()}s)`);
+        await backoff();
+        continue;
+      }
+      return { success: false, error: `Error polling queue: ${error.message}`, executed: "unknown" };
+    }
+
+    if (res.status === 404) {
+      consecutive404s++;
+      const reloaded = Boolean(res.data?.epoch && submitEpoch && res.data.epoch !== submitEpoch);
+      if (reloaded || consecutive404s >= MAX_STATUS_404_GRACE) {
+        const lost = {
+          success: false,
+          error:
+            `Ticket ${ticketId} not found or expired: ` +
+            (reloaded
+              ? "Unity reloaded its script domain while the command was pending, which discards queued commands."
+              : "Unity no longer knows this command."),
+          executed: "unknown",
+        };
+        // A query that was still queued can simply be asked again.
+        if (lastStatus === "Queued" && isReadOnlyCommand(command)) lost.resubmit = true;
+        return lost;
+      }
+      await backoff();
+      continue;
+    }
+
+    if (!res.ok) {
+      return { success: false, error: `Failed to poll queue status: HTTP ${res.status}: ${res.text}`, executed: "unknown" };
+    }
+
+    consecutive404s = 0;
+    const ticket = res.data || {};
+    const terminal = terminalResult(ticket);
+    if (terminal) return terminal;
+
+    lastStatus = ticket.status || lastStatus;
+    lastEditor = ticket.editor || null;
+
+    if (lastStatus === "Queued") {
+      // v2 plugins report main-thread liveness with every poll. A queued command can only start
+      // when the main thread ticks, so a long stall means waiting is pointless. The exception is
+      // a stall caused by another MCP command executing: that is the queue working as intended.
+      const editor = lastEditor;
+      if (editor && typeof editor.mainThreadStallMs === "number" && !editor.executing) {
+        const expected = editor.isCompiling || editor.isUpdating;
+        const limitMs = CONFIG.mainThreadStallTimeoutMs * (expected ? 3 : 1);
+        if (editor.mainThreadStallMs >= limitMs) {
+          const focusHint =
+            editor.applicationFocused === false
+              ? " The editor window is not focused. If a Multiplayer Play Mode player window has focus, bring the main editor forward."
+              : "";
+          return abandonTicket(
+            ticketId,
+            `Unity's main thread has not responded for ${Math.round(editor.mainThreadStallMs / 1000)}s ` +
+              `(${editor.busyReason || "blocked"}), so the command could not start.${focusHint}`,
+            editor
+          );
+        }
+      }
+      const busy = editor?.busyReason ? `, editor busy: ${editor.busyReason}` : "";
+      progress(`queued${busy}`, `Queued in Unity (${elapsedSec()}s${busy})`);
+    } else {
+      progress("executing", `Running in Unity (${elapsedSec()}s)`);
+    }
+
+    await backoff();
+  }
+}
+
+// ─── Legacy synchronous mode ───
+
+/**
+ * Direct POST /api/{command} for plugins without the queue. Only connection-level failures are
+ * retried: a timed-out synchronous call may still be running in Unity, and re-sending it would
+ * duplicate a non-idempotent command.
+ */
+async function sendCommandLegacyMode(command, params, deadline) {
+  for (let attempt = 0; ; attempt++) {
+    const remaining = deadline - Date.now();
+    try {
+      const res = await bridgeFetch(`/api/${command}`, {
+        method: "POST",
+        body: params,
+        timeoutMs: Math.max(1000, Math.min(CONFIG.editorBridgeTimeout, remaining)),
+      });
+      const delay = CONNECT_RETRY_DELAYS_MS[attempt];
+      if (res.status === 503 && delay !== undefined && Date.now() + delay < deadline) {
+        await sleep(delay); // server half-alive during a domain reload
+        continue;
+      }
+      if (!res.ok) return { success: false, error: `HTTP ${res.status}: ${res.text}` };
+      return { success: true, data: res.data };
+    } catch (error) {
+      if (isClientCancelled()) return { success: false, error: "Cancelled by the MCP client.", executed: "unknown" };
+      const delay = CONNECT_RETRY_DELAYS_MS[attempt];
+      if (isConnectionError(error) && delay !== undefined && Date.now() + delay < deadline) {
+        await sleep(delay);
+        continue;
+      }
+      if (isTimeoutError(error)) {
+        return {
+          success: false,
+          error: "Request timed out. Unity Editor may be in a long domain reload, or the command is still running.",
+          executed: "unknown",
+        };
+      }
+      return { success: false, error: `Connection failed: ${error.message}. ${unreachableHint()}`, executed: "no" };
+    }
+  }
+}
+
+// ─── Public API ───
+
+/**
+ * Send a command to the Unity Editor bridge and wait for its result.
+ * Queue mode first; falls back to legacy sync mode only for plugins without queue endpoints.
+ * @param {string} command Plugin route, e.g. "scene/info".
+ * @param {object} [params] JSON body for the route.
+ * @param {{timeoutMs?: number}} [options] Override the per-route wait budget.
+ */
+export async function sendCommand(command, params = {}, options = {}) {
+  const timeoutMs = options.timeoutMs ?? CONFIG.routeTimeoutsMs[command] ?? CONFIG.queuePollTimeoutMs;
+  const deadline = Date.now() + timeoutMs;
+  const bridgeUrl = getBridgeUrl();
+
+  if (_legacyBridges.has(bridgeUrl)) return sendCommandLegacyMode(command, params, deadline);
+
+  const bodyString = JSON.stringify(params);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const submitted = await submitTicket(command, bodyString, deadline);
+
+    if (submitted.unsupported) {
+      // A plugin that advertises the handshake has the queue (it predates the handshake), so a
+      // 404 here is not "no queue". Latching legacy mode on it used to downgrade the session.
+      const instance = getActiveInstance();
+      if (instance && typeof instance.protocolVersion === "number") {
+        return { success: false, error: `Unity answered HTTP 404 on queue/submit (plugin ${instance.pluginVersion || "?"}).`, executed: "no" };
+      }
+      console.error(`[MCP Bridge] Queue mode not supported by ${bridgeUrl} (HTTP 404), using legacy sync mode`);
+      _legacyBridges.add(bridgeUrl);
+      return sendCommandLegacyMode(command, params, deadline);
+    }
+    if (submitted.error) return { success: false, error: submitted.error, executed: submitted.executed };
+
+    const ticketId = submitted.ticket.ticketId;
+    console.error(`[MCP Bridge] Submitted ${command} to queue, ticket: ${ticketId}`);
+    const result = await awaitTicket(ticketId, { command, deadline, submitEpoch: submitted.ticket.epoch });
+
+    if (result.resubmit && attempt === 0 && Date.now() < deadline) {
+      console.error(`[MCP Bridge] Ticket ${ticketId} (${command}) lost to a domain reload while queued; resubmitting query.`);
+      continue;
+    }
+    delete result.resubmit;
+    return result;
+  }
+  return { success: false, error: `Command ${command} could not be completed.`, executed: "unknown" };
 }
 
 /**
@@ -384,27 +495,11 @@ export async function sendCommand(command, params = {}) {
  */
 export async function getQueueInfo() {
   try {
-    const url = `${getBridgeUrl()}/api/queue/info`;
-    const response = await fetch(url, {
-      method: "GET",
-      headers: {
-        "X-Agent-Id": _currentAgentId,
-      },
-      signal: AbortSignal.timeout(CONFIG.editorBridgeTimeout),
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      return { success: false, error: `HTTP ${response.status}: ${text}` };
-    }
-
-    const data = await response.json();
-    return { success: true, data };
+    const res = await bridgeFetch("/api/queue/info", { timeoutMs: STATUS_POLL_REQUEST_TIMEOUT_MS });
+    if (!res.ok) return { success: false, error: `HTTP ${res.status}: ${res.text}` };
+    return { success: true, data: res.data };
   } catch (error) {
-    return {
-      success: false,
-      error: `Failed to get queue info: ${error.message}`,
-    };
+    return { success: false, error: `Failed to get queue info: ${error.message}` };
   }
 }
 
@@ -414,46 +509,27 @@ export async function getQueueInfo() {
  */
 export async function getTicketStatus(ticketId) {
   try {
-    const url = `${getBridgeUrl()}/api/queue/status?ticketId=${ticketId}`;
-    const response = await fetch(url, {
-      method: "GET",
-      headers: {
-        "X-Agent-Id": _currentAgentId,
-      },
-      signal: AbortSignal.timeout(CONFIG.editorBridgeTimeout),
+    const res = await bridgeFetch(`/api/queue/status?ticketId=${encodeURIComponent(ticketId)}`, {
+      timeoutMs: STATUS_POLL_REQUEST_TIMEOUT_MS,
     });
-
-    if (!response.ok) {
-      const text = await response.text();
-      return { success: false, error: `HTTP ${response.status}: ${text}` };
-    }
-
-    const data = await response.json();
-    return { success: true, data };
+    if (!res.ok) return { success: false, error: `HTTP ${res.status}: ${res.text}` };
+    return { success: true, data: res.data };
   } catch (error) {
-    return {
-      success: false,
-      error: `Failed to get ticket status: ${error.message}`,
-    };
+    return { success: false, error: `Failed to get ticket status: ${error.message}` };
   }
 }
 
 /**
- * Check if the Unity Editor bridge is reachable
+ * Check if the Unity Editor bridge is reachable. On plugins >= protocolVersion 2 this is answered
+ * off the main thread and includes live state (busy/busyReason, mainThreadStallMs, isPlaying...).
  */
 export async function ping() {
   try {
-    const response = await fetch(`${getBridgeUrl()}/api/ping`, {
-      method: "GET",
-      signal: AbortSignal.timeout(3000),
-    });
-    if (response.ok) {
-      const data = await response.json();
-      return { connected: true, ...data };
-    }
-    return { connected: false, error: `HTTP ${response.status}` };
+    const res = await bridgeFetch("/api/ping", { timeoutMs: 3000 });
+    if (res.ok) return { connected: true, ...res.data };
+    return { connected: false, error: `HTTP ${res.status}` };
   } catch {
-    return { connected: false, error: "Unity Editor bridge not reachable" };
+    return { connected: false, error: "Unity Editor bridge not reachable", hint: unreachableHint() };
   }
 }
 
@@ -1706,21 +1782,12 @@ export async function deleteAllPlayerPrefs(params) {
  * @returns {object} Context data with categories and content.
  */
 export async function getProjectContext(category = null) {
-  const url = category
-    ? `${getBridgeUrl()}/api/context/${encodeURIComponent(category)}`
-    : `${getBridgeUrl()}/api/context`;
-
-  const response = await fetch(url, {
-    method: "GET",
-    headers: { "X-Agent-Id": _currentAgentId },
-    signal: AbortSignal.timeout(5000),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Context request failed: HTTP ${response.status}`);
+  const path = category ? `/api/context/${encodeURIComponent(category)}` : "/api/context";
+  const res = await bridgeFetch(path, { timeoutMs: 5000 });
+  if (!res.ok) {
+    throw new Error(`Context request failed: HTTP ${res.status}`);
   }
-
-  return response.json();
+  return res.data;
 }
 
 // ─── Testing ───
