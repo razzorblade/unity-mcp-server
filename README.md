@@ -210,6 +210,7 @@ Restart Claude Desktop. Done!
 | `UNITY_MCP_DEBUG` | unset | Set to `1` to append diagnostics to `UnityMCP/mcp-debug.log` (5MB rotation) |
 | `UNITY_MCP_PRETTY_JSON` | unset | Set to `1` to pretty-print tool responses (default is compact JSON — 20-50% fewer tokens) |
 | `UNITY_MCP_COMPACT_TOOLS` | unset | Set to `1` for a minimal tools/list (~21KB vs ~43KB): keeps all 79 tools and strict schema structure, drops per-parameter prose. For clients with registry size limits (e.g. Codex Desktop on Windows) |
+| `UNITY_MCP_MAX_RESPONSE_TOKENS` | `20000` | Token budget per tool result (estimated). A larger result arrives in pages: page 1 plus a notice, the rest via `unity_page {cursor, page}` — instead of being silently cut off by the client (Claude Code truncates at 25k by default). `0` disables paging |
 
 The Unity plugin also has its own settings accessible via the Dashboard (`Window > MCP Dashboard`) for port, auto-start, and per-category feature toggles.
 
