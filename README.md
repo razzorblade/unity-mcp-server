@@ -112,7 +112,13 @@ This keeps the tool count manageable for clients like Claude Desktop and Cowork 
 
 ### Multi-Instance Support
 
-The server automatically discovers all running Unity Editor instances on startup. If only one instance is found, it auto-connects. If multiple instances are running (e.g., main editor + ParrelSync clones), it prompts you to select which one to work with.
+The server automatically discovers all running Unity Editor instances on startup. One machine-wide install serves any number of editors at once, and each MCP session picks its editor as follows:
+
+1. **Only one editor running** → auto-connects. Multiplayer Play Mode virtual players are clones of an editor that is already running, so they never count as a second editor.
+2. **Several editors** → auto-connects to the editor whose project matches the session's workspace, checked in this order: `UNITY_PROJECT_PATH` (explicit), then the client's MCP roots, then the server's working directory. Claude Code starts the server in your project folder, so opening Claude Code in `ProjectA/` connects to ProjectA's editor. A workspace inside the project (`ProjectA/Assets/Scripts`) or a repo containing it (up to 3 levels deep) also matches.
+3. **Still ambiguous** (e.g. a folder containing two projects) → you're asked to pick with `unity_select_instance`.
+
+Ports stay dynamic (7890–7899). The match is by project path, so it survives editors restarting on different ports. To pin a session explicitly, set `UNITY_PROJECT_PATH` in that MCP server entry's `env`.
 
 **Port Resilience** — The server includes a multi-layer protection system for reliable multi-project workflows:
 
@@ -120,6 +126,18 @@ The server automatically discovers all running Unity Editor instances on startup
 - **Compile-Time Resilience** — During long Unity compiles (when the editor is unresponsive), the server checks the shared instance registry. If the registry entry is fresh (updated within the last 5 minutes via heartbeat), the connection is preserved instead of dropped.
 - **Crash Detection** — The plugin sends a heartbeat every 30 seconds to the instance registry. If Unity crashes and the heartbeat stops, the server detects the stale registry entry (>5 minutes old) and clears it, allowing proper re-discovery.
 - **Port Affinity** — The plugin remembers its last-used port via EditorPrefs and reclaims it on restart, minimizing port swaps across editor restarts.
+
+### Failure Reporting & Busy Editors
+
+Every command resolves within its deadline. It never hangs on a stuck editor.
+
+- **Busy vs. dead** — With plugin 2.40+, `ping` is answered off Unity's main thread and reports live state (`busy`, `busyReason`, `mainThreadStallMs`, `isPlaying`, `isCompiling`). A busy editor is no longer mistaken for a closed one.
+- **Stuck main thread → fast, definite failure** — If a command is still queued while Unity's main thread hasn't ticked for `UNITY_MAIN_THREAD_STALL_TIMEOUT` (default 20s, 3× while compiling/importing), it is cancelled in Unity and reported with the reason. Typical causes are a modal dialog, a long import, or a Multiplayer Play Mode window holding focus.
+- **`executed` field on failures** — `"no"` means the command never ran and is safe to retry. `"unknown"` means it may have run, so check the editor state first. The plugin also drops a ticket that could not start before the server stopped waiting, so an abandoned command never runs minutes later.
+- **Client cancellation** (e.g. pressing Esc) cancels the pending Unity ticket too.
+- **`unityConsole`** — warnings/errors Unity logged *while the command ran* are attached to the result, with a `warning` when they include errors. A call can "succeed" while Unity logs why it didn't do what was asked.
+- **Progress notifications** are sent while waiting (queued behind a busy editor, a running lightmap bake) when the client requests them.
+- **Lightmap baking** — `unity_lighting_bake` checks preconditions (Play mode, unsaved scene, compiling) and verifies the bake started. It waits server-side with progress and returns a final `Completed` / `Failed` / `Cancelled` / `Running` state. `unity_lighting_bake_status`, `_cancel`, and `unity_lighting_clear_baked` complete the set.
 
 ## Quick Start
 
@@ -178,7 +196,12 @@ Restart Claude Desktop. Done!
 | `UNITY_HUB_PATH` | `C:\Program Files\Unity Hub\Unity Hub.exe` | Unity Hub executable path |
 | `UNITY_BRIDGE_HOST` | `127.0.0.1` | Editor bridge host |
 | `UNITY_BRIDGE_PORT` | `7890` | Editor bridge port (auto-discovered when using multi-instance) |
-| `UNITY_BRIDGE_TIMEOUT` | `60000` | Request timeout in ms |
+| `UNITY_BRIDGE_TIMEOUT` | `60000` | Per-request timeout in ms for legacy (pre-queue) plugins |
+| `UNITY_PROJECT_PATH` | unset | Unity project this session belongs to; auto-selects its editor when several run. Several paths may be given, separated by `;` on Windows or `:` elsewhere |
+| `UNITY_QUEUE_POLL_TIMEOUT` | `120000` | Max wait for one command's result in ms (builds: `UNITY_BUILD_TIMEOUT`, default 30 min) |
+| `UNITY_MAIN_THREAD_STALL_TIMEOUT` | `20000` | A queued command is cancelled and reported when Unity's main thread hasn't ticked this long (3× while compiling/importing) |
+| `UNITY_QUEUE_SUBMIT_TIMEOUT` | `10000` | Max time for Unity to accept a command (enqueueing takes milliseconds; longer means the bridge is wedged) |
+| `UNITY_DISCOVERY_PING_TIMEOUT` | `2000` | Per-instance ping timeout during discovery in ms |
 | `UNITY_PORT_RANGE_START` | `7890` | Start of port scan range for multi-instance discovery |
 | `UNITY_PORT_RANGE_END` | `7899` | End of port scan range |
 | `UNITY_REGISTRY_STALENESS_TIMEOUT` | `300000` | Registry entry staleness timeout in ms (crash detection) |

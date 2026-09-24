@@ -2,6 +2,35 @@
 
 All notable changes to this package will be documented in this file.
 
+## [2.36.0] - 2026-09-24
+
+Companion to plugin **2.40.0** (`protocolVersion` 2). Works with older plugins; the new diagnostics simply stay off for them.
+
+### Fixed
+- **Commands could hang for ~10 minutes on a stuck editor, and only failed once Unity was killed.** A submit that timed out was retried 5× at 60s each (a timeout is not a transient error). Then the call fell back to legacy sync mode for another 5×60s, and polling could add 120s more. Now:
+  - submit gets 10s (`UNITY_QUEUE_SUBMIT_TIMEOUT`), and only connection-level failures (the request never reached Unity) are retried;
+  - legacy mode is used only for plugins that genuinely lack the queue, tracked per editor;
+  - a command still **queued** while Unity's main thread hasn't ticked for `UNITY_MAIN_THREAD_STALL_TIMEOUT` (20s; 3× while compiling/importing) is cancelled in Unity and reported with the reason (e.g. modal dialog, Multiplayer Play Mode window holding focus). A stall caused by another MCP command executing is waited on.
+- **Parallel tool calls could be routed to the wrong editor, and return the other editor's result.** The SDK runs calls concurrently, but the per-call `port` override and agent id were module-level globals set and cleared around each call. A call's status polls could go to another editor, and because each editor numbers tickets from 1, they found a same-numbered ticket there and returned *its* result. Routing now lives in an `AsyncLocalStorage` request context. The regression test fails on 2.35.6.
+- **Concurrent first calls raced discovery** and could reach the default port before the selection existed. They now share one discovery.
+- **Legacy sync mode retried timed-out requests**, which could run a non-idempotent command twice. Only connection failures are retried now.
+
+### Added
+- **One server, several editors: automatic workspace affinity.** When several editors run, the session auto-connects to the one whose project matches its workspace, checked in this order: `UNITY_PROJECT_PATH`, then the client's MCP roots (`roots/list`), then the working directory. The banner says why it picked the editor. An ambiguous workspace still asks.
+- **MPPM virtual players no longer force a manual pick.** They're recognized (`isVirtualPlayer` from plugin 2.40, or a `Library/VP/` path) and ignored when counting editors. `unity_list_instances` flags them, and `unity_select_instance projectName=` prefers the main editor.
+- **Failures say whether the command ran**: `executed: "no"` means safe to retry; `"unknown"` means verify first. Cancelled-before-start, dropped-past-deadline, still-executing and lost-to-a-domain-reload are reported distinctly. A reload is detected immediately via the plugin's `epoch`, and a read-only query lost that way is resubmitted automatically.
+- **Client cancellation** (`notifications/cancelled`) now cancels the pending Unity ticket.
+- **`unityConsole`** on results: the warnings/errors Unity logged while the command ran, plus a `warning` when they include errors.
+- **MCP progress notifications** while waiting (queued behind a busy editor, running, bridge reloading, bake progress), sent when the client provides a `progressToken`.
+- **Lightmap baking tools** (advanced tier): `unity_lighting_bake` checks preconditions and verifies that the bake started. By default it waits up to `waitSeconds` (60, max 1800) server-side and returns the final `Completed`/`Failed`/`Cancelled`/`Running` state, so agents no longer write polling loops for a bake that may never have started. Also `unity_lighting_bake_status`, `unity_lighting_bake_cancel`, `unity_lighting_clear_baked`.
+- `unity_editor_ping` / `unity_list_instances` show live editor state (`busy`, `busyReason`, `mainThreadStallMs`, …) that answers even while Unity is busy.
+- Config: `UNITY_PROJECT_PATH`, `UNITY_MAIN_THREAD_STALL_TIMEOUT`, `UNITY_QUEUE_SUBMIT_TIMEOUT`, `UNITY_DISCOVERY_PING_TIMEOUT`, `UNITY_BUILD_TIMEOUT` (`build/start` now waits up to 30 min instead of 2).
+
+### Changed
+- Advanced tier 269 → **273** tools (351 total), updated in the pinned tier test and `manifest.json`.
+- Instance validation uses one ping per tool call instead of two.
+- Tests: 60 → 83 (`tests/reliability.test.mjs`, `tests/unit/workspace-affinity.test.mjs`). The mock bridge speaks protocol v2 (live editor state, `queue/cancel`, frozen main thread, captured logs). Its legacy mode no longer advertises a handshake, matching real queue-less plugins.
+
 ## [2.35.6] - 2026-07-27
 
 Companion to plugin **2.39.5** (community-reported fixes).
