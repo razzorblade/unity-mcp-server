@@ -16,7 +16,7 @@ describe("splitToolTiers on the real tool set", () => {
   const split = splitToolTiers(ALL_TOOLS);
 
   test("tier counts are pinned (update deliberately when the surface changes)", () => {
-    assert.equal(split.coreCount, 69, "core tier count");
+    assert.equal(split.coreCount, 70, "core tier count");
     assert.equal(split.advancedCount, 291, "advanced tier count");
     assert.equal(split.coreCount + split.advancedCount, ALL_TOOLS.length);
   });
@@ -38,7 +38,7 @@ describe("splitToolTiers on the real tool set", () => {
       "unity_editor_state", "unity_scene_hierarchy", "unity_gameobject_create",
       "unity_component_set_property", "unity_execute_code", "unity_console_log",
       "unity_get_compilation_errors", "unity_play_mode", "unity_search_assets",
-      "unity_undo_last",
+      "unity_undo_last", "unity_asset_refresh",
     ]) {
       assert.ok(coreNames.has(name), `${name} stays core`);
     }

@@ -374,3 +374,70 @@ describe("lightmap bake (issue: endless polling for a bake that never started)",
     assert.ok(Date.now() - started < 2000, "no waiting on a bake that never started");
   });
 });
+
+describe("asset refresh (issue: 'Unity only refreshes when its window is focused')", () => {
+  /** @type {MockBridge} */ let bridge;
+  /** @type {McpTestClient} */ let client;
+  let compileErrors = [];
+
+  before(async () => {
+    bridge = new MockBridge();
+    // Background editor: an explicit refresh must not depend on focus.
+    bridge.editor.applicationFocused = false;
+    bridge.on("compilation/errors", () => ({ count: compileErrors.length, isCompiling: false, entries: compileErrors }));
+    await bridge.start();
+    client = new McpTestClient({ env: bridge.env(), timeoutMs: 30_000 }).start();
+    await client.initialize();
+  });
+
+  after(async () => {
+    await client.close();
+    await bridge.stop();
+  });
+
+  /** Plugin-side refresh that starts a compile ending after `ms`, optionally with a domain reload. */
+  function compileFor(ms, { reload }) {
+    bridge.on("asset/refresh", () => {
+      bridge.editor.isCompiling = true;
+      setTimeout(() => {
+        bridge.editor.isCompiling = false;
+        if (reload) bridge.instance.epoch = `${bridge.instance.epoch}+`;
+      }, ms);
+      return { success: true, compiling: true, refreshMs: 12, epoch: bridge.instance.epoch };
+    });
+  }
+
+  test("nothing to compile: answers without waiting", async () => {
+    bridge.on("asset/refresh", () => ({ success: true, compiling: false, refreshMs: 5, epoch: bridge.instance.epoch }));
+    const started = Date.now();
+    const { payload, isError } = await client.callTool("unity_asset_refresh");
+    assert.equal(isError, false, JSON.stringify(payload));
+    assert.equal(payload.compilation, "none");
+    assert.ok(Date.now() - started < 1500, "no compile wait when nothing compiles");
+  });
+
+  test("waits out the compile and reports the domain reload", async () => {
+    compileFor(800, { reload: true });
+    const { payload, isError } = await client.callTool("unity_asset_refresh");
+    assert.equal(isError, false, JSON.stringify(payload));
+    assert.equal(payload.compilation, "succeeded");
+    assert.equal(payload.domainReloaded, true);
+    assert.ok(payload.waitedMs >= 700, `waited for the compile (${payload.waitedMs}ms)`);
+  });
+
+  test("a failed compile (no reload) returns the compile errors", async () => {
+    compileErrors = [{ file: "Assets/Foo.cs", line: 3, column: 5, message: "CS1002: ; expected", severity: "error" }];
+    compileFor(500, { reload: false });
+    const { payload } = await client.callTool("unity_asset_refresh");
+    assert.equal(payload.compilation, "failed");
+    assert.equal(payload.errors.length, 1);
+    assert.match(payload.warning, /failed to compile/);
+  });
+
+  test("waitSeconds 0 returns while still compiling", async () => {
+    compileFor(5000, { reload: true });
+    const { payload } = await client.callTool("unity_asset_refresh", { waitSeconds: 0 });
+    assert.equal(payload.compilation, "pending");
+    assert.ok(payload.next);
+  });
+});

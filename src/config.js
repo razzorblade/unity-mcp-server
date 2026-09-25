@@ -51,6 +51,7 @@ export const CONFIG = {
     "build/start": parseInt(process.env.UNITY_BUILD_TIMEOUT || "1800000"), // 30 min
     "packages/add": 300000,
     "packages/remove": 300000,
+    "asset/refresh": 300000, // a large import can outlast the default wait
   },
 
   // Default Unity Editor path pattern (version will be interpolated)

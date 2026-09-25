@@ -107,6 +107,7 @@ const CORE_TOOLS = new Set([
   // Asset management
   "unity_asset_list",
   "unity_asset_import",
+  "unity_asset_refresh",
   "unity_asset_delete",
   "unity_asset_create_prefab",
   "unity_asset_instantiate_prefab",

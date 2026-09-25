@@ -81,6 +81,104 @@ async function bakeLighting({ clearFirst, waitSeconds } = {}) {
   });
 }
 
+const REFRESH_POLL_MS = 500;
+// Idle same-epoch pings in a row meaning no domain reload is coming (the compile failed, or no
+// assembly changed). A single idle ping is not enough: Unity clears isCompiling ~20ms BEFORE a
+// successful compile's reload starts.
+const REFRESH_SETTLE_POLLS = 3;
+const REFRESH_DEFAULT_WAIT_SECONDS = 120;
+const REFRESH_MAX_WAIT_SECONDS = 600;
+const REFRESH_MAX_ERRORS = 50;
+const REFRESH_PENDING_NEXT =
+  "Still compiling. Done when unity_editor_ping shows isCompiling=false; then check unity_get_compilation_errors.";
+
+/**
+ * Refresh the AssetDatabase and (optionally) wait server-side until the script compilation and
+ * domain reload it triggers are over, then report compile errors: one call instead of Ctrl+R
+ * plus a hand-written polling loop. Needs no editor focus; only Unity's AUTOMATIC refresh waits
+ * for focus, an explicit one runs whenever the main thread ticks (it keeps ticking unfocused).
+ */
+async function refreshAssets({ forceRecompile, waitSeconds } = {}) {
+  const res = await bridge.refreshAssets(forceRecompile === true ? { forceRecompile: true } : {});
+  if (isUnknownRouteResult(res)) {
+    return formatResult({
+      success: false,
+      error:
+        "This Unity plugin predates asset/refresh (added in plugin 2.42). Update the plugin, or run " +
+        "unity_execute_code with `UnityEditor.AssetDatabase.Refresh();`.",
+    });
+  }
+  // A fast successful compile reloads the domain, which can evict the ticket before its result
+  // is read. The reload itself proves the refresh ran and compiled.
+  const lostToReload = res?.success === false && /reloaded its script domain/i.test(res.error || "");
+  if (!lostToReload && (!res?.success || !res.data || res.data.success === false)) return formatResult(res);
+
+  const data = lostToReload ? { compiling: true } : res.data;
+  const base = { success: true, refreshMs: data.refreshMs, note: data.note, unityConsole: res.unityConsole };
+  if (!data.compiling) return formatResult({ ...base, compilation: "none" });
+
+  const waitMs =
+    Math.min(Math.max(Number(waitSeconds ?? REFRESH_DEFAULT_WAIT_SECONDS) || 0, 0), REFRESH_MAX_WAIT_SECONDS) * 1000;
+  if (waitMs === 0) return formatResult({ ...base, compilation: "pending", next: REFRESH_PENDING_NEXT });
+
+  const startedAt = Date.now();
+  const deadline = startedAt + waitMs;
+  let reloaded = lostToReload;
+  let idlePolls = 0;
+  let settled = false;
+  while (!isRequestCancelled() && Date.now() < deadline) {
+    await delay(Math.min(REFRESH_POLL_MS, Math.max(0, deadline - Date.now())));
+    const ping = await bridge.ping();
+    const elapsed = Math.round((Date.now() - startedAt) / 1000);
+    if (!ping.connected) {
+      idlePolls = 0;
+      bridge.reportProgress(`Reloading script domain (${elapsed}s)`);
+      continue;
+    }
+    if (data.epoch && ping.epoch && ping.epoch !== data.epoch) reloaded = true;
+    if (ping.isCompiling || ping.isUpdating) {
+      idlePolls = 0;
+      bridge.reportProgress(`Compiling scripts (${elapsed}s)`);
+      continue;
+    }
+    if (reloaded || ++idlePolls >= REFRESH_SETTLE_POLLS) {
+      settled = true;
+      break;
+    }
+  }
+
+  const waitedMs = Date.now() - startedAt;
+  if (!settled) {
+    return formatResult({
+      ...base,
+      compilation: "pending",
+      waitedMs,
+      next: REFRESH_PENDING_NEXT,
+    });
+  }
+  if (reloaded) return formatResult({ ...base, compilation: "succeeded", domainReloaded: true, waitedMs });
+
+  // Same domain after compiling: either no assembly changed or the compile failed.
+  const errors = await bridge.getCompilationErrors({ severity: "error", count: REFRESH_MAX_ERRORS });
+  const entries = errors?.data?.entries;
+  if (!errors?.success || !Array.isArray(entries)) {
+    return formatResult({
+      ...base,
+      compilation: "unknown",
+      waitedMs,
+      next: "Compilation ended without a domain reload, but its errors could not be read. Check unity_get_compilation_errors.",
+    });
+  }
+  if (entries.length === 0) return formatResult({ ...base, compilation: "succeeded", domainReloaded: false, waitedMs });
+  return formatResult({
+    ...base,
+    compilation: "failed",
+    waitedMs,
+    errors: entries,
+    warning: "Scripts failed to compile. Unity keeps running the previous assemblies until the errors are fixed.",
+  });
+}
+
 // Shared shaping for image-returning graphics tools.
 // The bridge wraps plugin payloads as { success, data: { ..., base64 } } (queue mode)
 // but legacy mode and some code paths surface { ..., base64 } at the top level, so the
@@ -530,6 +628,23 @@ export const editorTools = [
       required: ["sourcePath", "destinationPath"],
     },
     handler: async (params) => formatResult(await bridge.importAsset(params)),
+  },
+  {
+    name: "unity_asset_refresh",
+    description:
+      "Import files changed outside Unity and compile changed scripts (Ctrl+R); works while Unity is unfocused. " +
+      "Waits for the compile + domain reload and returns compile errors.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        forceRecompile: { type: "boolean", description: "Recompile even if no script changed" },
+        waitSeconds: {
+          type: "number",
+          description: `Max wait (default ${REFRESH_DEFAULT_WAIT_SECONDS}, max ${REFRESH_MAX_WAIT_SECONDS}, 0 = no wait)`,
+        },
+      },
+    },
+    handler: async (params) => refreshAssets(params),
   },
   {
     name: "unity_asset_delete",

@@ -168,11 +168,13 @@ describe("queue-mode session (single instance)", () => {
   // 49.5KB for 2.37: unity_page (token-budget paging of large results), nested-property reads
   // (propertyPath/maxDepth/maxArrayElements), asset_list paging (offset/includeGuid) and console
   // collapse. The dense-shape verbose flag stays out of core schemas to keep this small.
+  // 49.8KB for 2.38: core unity_asset_refresh (explicit refresh + compile wait that works while
+  // the editor is unfocused; Unity's auto refresh only runs on focus regain).
   // Bump this only for a real new capability, never to absorb prose creep.
   test("tools/list payload stays within the rich-mode diet budget", async () => {
     const { tools } = await client.listTools();
     const bytes = Buffer.byteLength(JSON.stringify(tools), "utf8");
-    assert.ok(bytes <= 49_500, `tools/list ${bytes} bytes exceeds the 49.5KB rich-mode budget`);
+    assert.ok(bytes <= 49_800, `tools/list ${bytes} bytes exceeds the 49.8KB rich-mode budget`);
   });
 
   // Lazy discovery is three-tier so finding one tool never costs a schema dump:
@@ -562,12 +564,13 @@ describe("compact tool registry mode (UNITY_MCP_COMPACT_TOOLS=1)", () => {
     await bridge.stop();
   });
 
-  test("keeps all 79 tools but fits constrained-client budgets (issue #27)", async () => {
+  test("keeps all 80 tools but fits constrained-client budgets (issue #27)", async () => {
     const { tools } = await client.listTools();
     assert.ok(tools.length >= 70 && tools.length <= 90, `all tools still exposed (${tools.length})`);
     const bytes = Buffer.byteLength(JSON.stringify(tools), "utf8");
     console.error(`[gate] compact tools/list payload: ${(bytes / 1024).toFixed(1)} KB`);
-    assert.ok(bytes <= 24_000, `compact tools/list ${bytes} bytes exceeds 24KB`);
+    // 24.3KB since 2.38 (core unity_asset_refresh).
+    assert.ok(bytes <= 24_300, `compact tools/list ${bytes} bytes exceeds 24.3KB`);
   });
 
   test("schema structure stays strict (types/required survive, prose dropped)", async () => {

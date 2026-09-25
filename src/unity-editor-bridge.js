@@ -618,6 +618,10 @@ export async function importAsset(params) {
   return sendCommand("asset/import", params);
 }
 
+export async function refreshAssets(params = {}) {
+  return sendCommand("asset/refresh", params);
+}
+
 export async function deleteAsset(params) {
   return sendCommand("asset/delete", params);
 }
