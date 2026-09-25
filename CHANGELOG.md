@@ -2,6 +2,20 @@
 
 All notable changes to this package will be documented in this file.
 
+## [Unreleased]
+
+Companion to the plugin's FishNet integration. Against older plugins these tools return unknown-route errors.
+
+### Added
+- **18 Fish-Networking (FishNet 4.x) tools** in the advanced tier, `fishnet` category. Tool names map straight to plugin routes.
+  - Inspection: `unity_fishnet_status`, `unity_fishnet_get_network_object` (live SyncVar values), `unity_fishnet_list_network_objects` and `unity_fishnet_list_prefabs`.
+  - Edit Mode setup: `unity_fishnet_setup_network_manager`, `unity_fishnet_configure_transport`, `unity_fishnet_add_network_object`, `unity_fishnet_refresh_prefabs` and `unity_fishnet_register_prefab`.
+  - Play Mode: `unity_fishnet_start` (waits until connected), `unity_fishnet_stop`, `unity_fishnet_list_connections`, `unity_fishnet_spawn`, `unity_fishnet_despawn`, `unity_fishnet_set_ownership`, `unity_fishnet_kick`, `unity_fishnet_load_scene` and `unity_fishnet_unload_scene`.
+
+### Changed
+- Tool count 352 → 370 (69 core + 291 advanced). `tools/list` is unchanged at 47.9 KB, because the new tools are advanced-tier.
+- Tests: 101 → 104. The tier split pins the FishNet count and route parity, and a protocol test covers the deferred-route dispatch, `isError` on a plugin refusal and keyword discovery.
+
 ## [2.37.0] - 2026-09-25
 
 Companion to plugin **2.41.0** (token-dense responses). Works with older plugins, which simply keep their verbose shapes.

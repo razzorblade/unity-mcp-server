@@ -259,7 +259,7 @@ export function splitToolTiers(allEditorTools) {
       "Discover advanced Unity tools (execute them via unity_advanced_tool) without loading full schemas: " +
       "search=keywords → matching tools; category=name → its tools with parameter names; " +
       "tool=name → that tool's full parameter schema; no args → all category names with counts " +
-      "(e.g. animation, terrain, shadergraph, probuilder, uma, physics, lighting, ui, …).",
+      "(e.g. animation, terrain, shadergraph, probuilder, fishnet, uma, physics, lighting, ui, …).",
     inputSchema: {
       type: "object",
       properties: {

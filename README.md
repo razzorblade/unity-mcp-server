@@ -77,6 +77,7 @@
 | **Shader Graph** | List, inspect, create, open Shader Graphs & Sub Graphs; VFX Graphs |
 | **Amplify Shader Editor** | Full graph manipulation — create, inspect, add/remove/connect/disconnect/duplicate nodes, set properties, templates, save/close (if installed) |
 | **MPPM Scenarios** | List, activate, start, stop multiplayer playmode scenarios; get status & player info |
+| **FishNet** | Set up NetworkManager/transport, NetworkObjects and spawnable prefabs; start host/server/client and spawn, despawn, transfer ownership, load scenes; inspect SyncVars live (requires FishNet 4.x) |
 | **Multi-Instance** | Discover and switch between multiple running Unity Editor instances |
 | **Multi-Agent** | List active agents, get agent action logs, queue monitoring |
 | **SpriteAtlas** | Create, inspect, add/remove sprites, configure settings, delete, list SpriteAtlases |
@@ -225,6 +226,7 @@ Some tools activate automatically when their packages are detected in the Unity 
 | `com.unity.visualeffectgraph` | VFX Graph listing and opening |
 | `com.unity.inputsystem` | Input Action map and binding inspection |
 | `com.unity.multiplayer.playmode` | MPPM scenario listing, activation, start/stop, player info |
+| FishNet 4.x (`com.firstgeargames.fishnet`) | NetworkManager/transport setup, NetworkObjects, spawnable prefabs, SyncType inspection, and live sessions: start/stop host/server/client, spawn/despawn, ownership, kick, networked scene loads |
 | Amplify Shader Editor (Asset Store) | Amplify shader listing, inspection, opening |
 | UMA 2 (Asset Store) | UMA SlotDataAsset/OverlayDataAsset creation, WardrobeRecipe pipeline, Global Library management, DCA wardrobe equip/unequip |
 

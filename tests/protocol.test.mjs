@@ -65,6 +65,13 @@ describe("queue-mode session (single instance)", () => {
       success: true, name: p.name || `PB_${p.shape || "cube"}`, instanceId: "-14510",
       faceCount: 6, vertexCount: 24, shape: p.shape || "cube",
     }));
+    // FishNet fixtures: a successful deferred start, and a plugin-side refusal ({error, hint}).
+    bridge.on("fishnet/start", (p) => ({
+      success: true, mode: p.mode || "host", state: p.mode || "host", port: 7770, clientId: 0, authenticated: true,
+    }));
+    bridge.on("fishnet/spawn", () => ({
+      error: "This needs a running FishNet session.", hint: "Enter Play Mode (unity_play_mode), then fishnet/start.",
+    }));
     // Per-action undo (core tool) — echoes params so the test can assert forwarding.
     bridge.on("undo/last", (p) => ({
       success: true, message: "Reverted 'probuilder/create-shape'.", revertedCount: 1,
@@ -307,6 +314,25 @@ describe("queue-mode session (single instance)", () => {
     assert.ok(seen, "bridge received the probuilder/create-shape route");
     assert.equal(seen.params.shape, "cylinder", "params forwarded intact");
     assert.equal(seen.via, "queue", "routed through the multi-agent queue");
+  });
+
+  test("FishNet tools dispatch to their plugin routes and surface plugin refusals as errors", async () => {
+    const started = await client.callTool("unity_advanced_tool", {
+      tool: "unity_fishnet_start",
+      params: { mode: "server", waitSeconds: 2 },
+    });
+    assert.equal(started.isError, false);
+    assert.equal(started.payload.data.state, "server");
+    const seen = bridge.seen.find((r) => r.route === "fishnet/start");
+    assert.ok(seen, "bridge received fishnet/start");
+    assert.equal(seen.params.mode, "server", "params forwarded intact");
+    assert.equal(seen.via, "queue", "deferred plugin routes need the async queue");
+
+    const refused = await client.callTool("unity_advanced_tool", { tool: "unity_fishnet_spawn", params: { prefab: "Enemy" } });
+    assert.equal(refused.isError, true, "an {error} result is flagged isError");
+
+    const search = await client.callTool("unity_list_advanced_tools", { search: "fishnet ownership" });
+    assert.equal(search.payload.results[0].name, "unity_fishnet_set_ownership", "discoverable by keyword");
   });
 
   test("play_mode recovers from a reload-evicted ticket by verifying the editor state", async () => {

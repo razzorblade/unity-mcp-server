@@ -8,17 +8,17 @@ import { splitToolTiers } from "../../src/tool-tiers.js";
 import { editorTools } from "../../src/tools/editor-tools.js";
 import { umaTools } from "../../src/tools/uma-tools.js";
 import { probuilderTools } from "../../src/tools/probuilder-tools.js";
+import { fishnetTools } from "../../src/tools/fishnet-tools.js";
+
+const ALL_TOOLS = [...editorTools, ...umaTools, ...probuilderTools, ...fishnetTools];
 
 describe("splitToolTiers on the real tool set", () => {
-  const split = splitToolTiers([...editorTools, ...umaTools, ...probuilderTools]);
+  const split = splitToolTiers(ALL_TOOLS);
 
   test("tier counts are pinned (update deliberately when the surface changes)", () => {
     assert.equal(split.coreCount, 69, "core tier count");
-    assert.equal(split.advancedCount, 273, "advanced tier count");
-    assert.equal(
-      split.coreCount + split.advancedCount,
-      editorTools.length + umaTools.length + probuilderTools.length
-    );
+    assert.equal(split.advancedCount, 291, "advanced tier count");
+    assert.equal(split.coreCount + split.advancedCount, ALL_TOOLS.length);
   });
 
   test("meta-tools are generated with strict-enough schemas", () => {
@@ -45,7 +45,7 @@ describe("splitToolTiers on the real tool set", () => {
   });
 
   test("no tool is lost or duplicated across tiers", () => {
-    const all = [...editorTools, ...umaTools, ...probuilderTools];
+    const all = ALL_TOOLS;
     const seen = new Set();
     for (const t of all) {
       assert.ok(!seen.has(t.name), `duplicate tool definition: ${t.name}`);
@@ -58,7 +58,7 @@ describe("splitToolTiers on the real tool set", () => {
   });
 
   test("every tool definition has the {name, description, inputSchema, handler} contract", () => {
-    for (const t of [...editorTools, ...umaTools, ...probuilderTools]) {
+    for (const t of ALL_TOOLS) {
       assert.ok(/^unity_[a-z0-9_]+$/.test(t.name), `name convention: ${t.name}`);
       assert.equal(typeof t.description, "string");
       assert.equal(t.inputSchema?.type, "object", `${t.name} schema root`);
@@ -81,7 +81,7 @@ describe("splitToolTiers on the real tool set", () => {
         walk(toolName, `${path}[]`, schema.items, out);
     };
     const violations = [];
-    for (const t of [...editorTools, ...umaTools, ...probuilderTools])
+    for (const t of ALL_TOOLS)
       for (const [prop, schema] of Object.entries(t.inputSchema?.properties || {}))
         walk(t.name, prop, schema, violations);
     assert.deepEqual(violations, [], `${violations.length} untyped properties: ${violations.slice(0, 10).join(", ")}`);
@@ -112,6 +112,32 @@ describe("splitToolTiers on the real tool set", () => {
     ]);
     const derived = new Set(probuilderTools.map((t) => derive(t.name)));
     assert.deepEqual(derived, expected, "derived routes must match the plugin's registered routes");
+  });
+
+  test("all 18 FishNet tools land in the advanced tier under the 'fishnet' category", () => {
+    const coreNames = new Set(split.coreTools.map((t) => t.name));
+    assert.equal(fishnetTools.length, 18, "FishNet tool count");
+    for (const t of fishnetTools) {
+      assert.ok(!coreNames.has(t.name), `${t.name} must be advanced, not core`);
+      assert.equal(t.name.replace(/^unity_/, "").split("_")[0], "fishnet", `${t.name} category`);
+    }
+  });
+
+  test("FishNet tool names derive to the exact plugin routes (lazy-load parity)", () => {
+    const derive = (name) => {
+      const parts = name.replace(/^unity_/, "").split("_");
+      return `${parts[0]}/${parts.slice(1).join("-")}`;
+    };
+    // Mirrors the fishnet/* cases in the plugin's MCPBridgeServer (fishnet/start is a deferred route).
+    const expected = new Set([
+      "fishnet/status", "fishnet/setup-network-manager", "fishnet/configure-transport",
+      "fishnet/add-network-object", "fishnet/get-network-object", "fishnet/list-network-objects",
+      "fishnet/list-prefabs", "fishnet/refresh-prefabs", "fishnet/register-prefab",
+      "fishnet/start", "fishnet/stop", "fishnet/list-connections",
+      "fishnet/spawn", "fishnet/despawn", "fishnet/set-ownership", "fishnet/kick",
+      "fishnet/load-scene", "fishnet/unload-scene",
+    ]);
+    assert.deepEqual(new Set(fishnetTools.map((t) => derive(t.name))), expected);
   });
 });
 
