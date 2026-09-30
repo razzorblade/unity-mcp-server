@@ -7,6 +7,8 @@
 // inside Unity:
 //   "no"      — the command never ran (not delivered, cancelled or dropped before starting): safe to retry.
 //   "unknown" — it may have run (still executing, or lost to a domain reload): verify before retrying.
+//   "paused"  — it is running inside Unity, held by a native dialog (plugin protocolVersion 3):
+//               it finishes once the dialog is answered, so it must NOT be resent.
 // Failures raised BY the command itself (exceptions, validation) carry no `executed` field.
 import { CONFIG } from "./config.js";
 import { getActiveBridgeUrl, getActiveInstance } from "./instance-discovery.js";
@@ -99,7 +101,130 @@ function summarizeEditor(editor) {
     isPlaying: editor.isPlaying,
     isCompiling: editor.isCompiling,
     applicationFocused: editor.applicationFocused,
+    ...(editor.dialog ? { dialog: editor.dialog } : {}),
   };
+}
+
+// ─── Blocking dialogs (plugin protocolVersion 3) ───
+
+/** Window kinds that wait on a human decision. A "progress" window ends on its own. */
+const BLOCKING_DIALOG_KINDS = new Set(["dialog", "filePanel", "window"]);
+
+/** The native dialog in a health snapshot that is holding the main thread, or null. */
+function blockingDialog(editor) {
+  const dialog = editor?.dialog;
+  return dialog && BLOCKING_DIALOG_KINDS.has(dialog.kind) ? dialog : null;
+}
+
+/** The exact follow-up call, spelled out so the agent does not have to discover the tool. */
+function dialogClickCall(dialog) {
+  return (
+    `unity_advanced_tool {"tool":"unity_editor_dialog_click","params":{"dialogId":"${dialog.id}",` +
+    `"button":"<one of the buttons>"}}`
+  );
+}
+
+/** One sentence naming the dialog, then what the agent can do about it. */
+function describeDialog(dialog) {
+  const title = dialog.title ? `"${dialog.title}"` : "(untitled)";
+  const message = dialog.message ? ` — "${dialog.message}"` : "";
+  const buttons = JSON.stringify(dialog.buttons || []);
+  let text = `Dialog is blocking this command: ${title}${message}.`;
+  if (dialog.kind === "window") {
+    text += " It is a window drawn by Unity and cannot be clicked through MCP: ask the user to close it.";
+  } else if (dialog.clickDisabled) {
+    text += ` Buttons: ${buttons}. Answering dialogs through MCP is disabled in this project: ask the user to answer it.`;
+  } else if (dialog.clickable) {
+    text += dialog.kind === "filePanel"
+      ? ` It is a file panel and can only be dismissed with ${buttons}: ${dialogClickCall(dialog)}.`
+      : ` Pick one: ${buttons} and answer it with ${dialogClickCall(dialog)}.`;
+    if (dialog.optOut) text += ` (Its "${dialog.optOut}" checkbox is left unchanged.)`;
+  } else {
+    text += ` Buttons: ${buttons}. It cannot be answered through MCP here: ask the user to answer it.`;
+  }
+  return text;
+}
+
+// Commands held by a dialog, per agent and editor: the dialog-click tool resumes and returns them.
+// Each also keeps a quiet background poll, so its result survives the plugin's 60s result cache
+// when a human answers the dialog before the agent comes back.
+/** @type {Map<string, {ticketId: string, command: string, epoch?: string, background: Promise<object>}>} */
+const _pausedCommands = new Map();
+
+function pausedKey() {
+  return `${getBridgeUrl()}|${currentAgentId()}`;
+}
+
+function routeTimeoutMs(command) {
+  return CONFIG.routeTimeoutsMs[command] ?? CONFIG.queuePollTimeoutMs;
+}
+
+function rememberPausedCommand(ticketId, command, epoch) {
+  const key = pausedKey();
+  const existing = _pausedCommands.get(key);
+  if (existing && existing.ticketId === String(ticketId)) return; // chained dialog: already tracked
+  const background = awaitTicket(ticketId, {
+    command,
+    deadline: Date.now() + routeTimeoutMs(command),
+    submitEpoch: epoch,
+    detectDialogs: false,
+    quiet: true,
+  }).catch((error) => ({ success: false, error: `Lost track of the paused command: ${error.message}`, executed: "unknown" }));
+  _pausedCommands.set(key, { ticketId: String(ticketId), command, epoch, background });
+}
+
+/**
+ * Stop waiting on a ticket held by a native dialog and hand the decision to the agent.
+ * Queued behind the dialog → cancelled (did not run, resend after answering).
+ * Executing → cannot be cancelled; it resumes once the dialog is answered (do not resend).
+ */
+async function stopForDialog(ticketId, status, dialog, editor, { command, submitEpoch }) {
+  const described = describeDialog(dialog);
+  const { dialog: _sameDialog, ...editorSummary } = summarizeEditor(editor) || {};
+  const base = { success: false, ticketId, dialog, editor: editorSummary };
+
+  if (status === "Queued") {
+    const cancel = await cancelTicket(ticketId);
+    if (cancel?.cancelled === true) {
+      return {
+        ...base,
+        error: `${described} Your command was queued behind it and has been cancelled: it did NOT run. Answer the dialog, then call the command again.`,
+        executed: "no",
+      };
+    }
+    if (cancel && (cancel.status === "Completed" || cancel.status === "Failed")) {
+      const finished = await fetchTerminal(ticketId);
+      if (finished) return finished;
+    }
+    // Started meanwhile: it is now the command the dialog holds.
+  }
+
+  rememberPausedCommand(ticketId, command, submitEpoch);
+  const ownDialog = editor?.executingTicketId !== undefined && String(editor.executingTicketId) === String(ticketId);
+  const held = ownDialog
+    ? "Your command raised it and is paused inside Unity until it is answered"
+    : "Your command is running in Unity and cannot finish until it is answered";
+  const resume = dialog.clickable
+    ? "unity_editor_dialog_click returns its result."
+    : `Check its result afterwards with unity_queue_ticket_status (ticketId ${ticketId}).`;
+  return {
+    ...base,
+    error: `${described} ${held}; it then finishes on its own, so do NOT send it again. ${resume}`,
+    executed: "paused",
+  };
+}
+
+/** A ticket's terminal result straight from the plugin, or null. */
+async function fetchTerminal(ticketId) {
+  try {
+    const res = await bridgeFetch(`/api/queue/status?ticketId=${ticketId}`, {
+      timeoutMs: CANCEL_REQUEST_TIMEOUT_MS,
+      ignoreClientCancel: true,
+    });
+    return res.ok && res.data ? terminalResult(res.data) : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -283,9 +408,13 @@ function terminalResult(ticket) {
 /**
  * Wait for a ticket's result. Returns within the deadline with either the result or a precise
  * failure: a command stuck behind a frozen main thread is cancelled and reported instead of
- * waited on, and a client cancellation cancels the ticket too.
+ * waited on, a native dialog holding it is reported with its buttons, and a client
+ * cancellation cancels the ticket too.
+ * @param {object} options
+ * @param {boolean} [options.detectDialogs] Stop and report when a native dialog holds the command (default true).
+ * @param {boolean} [options.quiet] No progress notifications (background polls outlive their request).
  */
-async function awaitTicket(ticketId, { command, deadline, submitEpoch }) {
+async function awaitTicket(ticketId, { command, deadline, submitEpoch, detectDialogs = true, quiet = false }) {
   let pollIntervalMs = CONFIG.queuePollIntervalMs;
   const startedAt = Date.now();
   let lastStatus = "Queued";
@@ -296,6 +425,7 @@ async function awaitTicket(ticketId, { command, deadline, submitEpoch }) {
 
   const elapsedSec = () => Math.round((Date.now() - startedAt) / 1000);
   const progress = (key, message) => {
+    if (quiet) return;
     const now = Date.now();
     if (key !== lastProgressKey || now - lastProgressAt >= PROGRESS_INTERVAL_MS) {
       lastProgressKey = key;
@@ -348,6 +478,7 @@ async function awaitTicket(ticketId, { command, deadline, submitEpoch }) {
               ? "Unity reloaded its script domain while the command was pending, which discards queued commands."
               : "Unity no longer knows this command."),
           executed: "unknown",
+          lost: true, // internal: callers strip it
         };
         // A query that was still queued can simply be asked again.
         if (lastStatus === "Queued" && isReadOnlyCommand(command)) lost.resubmit = true;
@@ -368,6 +499,13 @@ async function awaitTicket(ticketId, { command, deadline, submitEpoch }) {
 
     lastStatus = ticket.status || lastStatus;
     lastEditor = ticket.editor || null;
+
+    // A native dialog waits on a human decision: waiting longer cannot help, so report it with
+    // its buttons, whether the dialog holds this command or sits in front of it.
+    const dialog = detectDialogs ? blockingDialog(lastEditor) : null;
+    if (dialog) {
+      return stopForDialog(ticketId, lastStatus, dialog, lastEditor, { command, submitEpoch });
+    }
 
     if (lastStatus === "Queued") {
       // v2 plugins report main-thread liveness with every poll. A queued command can only start
@@ -484,9 +622,79 @@ export async function sendCommand(command, params = {}, options = {}) {
       continue;
     }
     delete result.resubmit;
+    delete result.lost;
     return result;
   }
   return { success: false, error: `Command ${command} could not be completed.`, executed: "unknown" };
+}
+
+/**
+ * Press a button on the native dialog blocking Unity (plugin protocolVersion 3, Windows editor),
+ * then finish the command that dialog was holding, so the agent gets that command's real result
+ * instead of resending it. A chained dialog comes back as that command's "paused" result.
+ * @param {string} dialogId The `dialog.id` the agent read (a different live dialog is refused).
+ * @param {string} button A button label, or a role: "primary" | "cancel" | "alternate" | "default".
+ */
+export async function clickDialog(dialogId, button) {
+  const instance = getActiveInstance();
+  if (instance && typeof instance.protocolVersion === "number" && !pluginSupports(instance, "DIALOG_DETECTION")) {
+    return {
+      success: false,
+      error: `The Unity plugin (${instance.pluginVersion || "protocol " + instance.protocolVersion}) cannot answer dialogs. Update it, or ask the user to answer the dialog.`,
+    };
+  }
+
+  let res;
+  try {
+    res = await bridgeFetch("/api/dialog/click", {
+      method: "POST",
+      body: { dialogId, button },
+      timeoutMs: STATUS_POLL_REQUEST_TIMEOUT_MS,
+    });
+  } catch (error) {
+    return { success: false, error: `Could not reach Unity to answer the dialog (${error.cause?.code || error.message}). ${unreachableHint()}` };
+  }
+
+  const key = pausedKey();
+  const paused = _pausedCommands.get(key);
+  // 404: no dialog any more (a human may have answered it). The paused command still has a result.
+  const answered = res.status === 200 || res.status === 404;
+  if (!answered) {
+    const failure = { success: false, error: res.data?.error || `HTTP ${res.status}: ${res.text}` };
+    if (res.data?.current) failure.dialog = res.data.current;
+    return failure;
+  }
+
+  const data =
+    res.status === 200
+      ? { clicked: true, button: res.data?.button, dialog: res.data?.dialog, dismissed: res.data?.dismissed === true }
+      : { clicked: false, note: res.data?.error || "No dialog is blocking the editor." };
+  if (!paused) {
+    return res.status === 200 ? { success: true, data } : { success: false, error: data.note };
+  }
+
+  data.resumedCommand = await resumePausedCommand(paused);
+  // Held again by a chained dialog → the entry (and its background poll) stays for the next click.
+  if (data.resumedCommand.executed !== "paused" && _pausedCommands.get(key) === paused) _pausedCommands.delete(key);
+  return { success: true, data };
+}
+
+/** Wait for a dialog-held command to finish; a further dialog is reported like the first one. */
+async function resumePausedCommand(paused) {
+  const live = await awaitTicket(paused.ticketId, {
+    command: paused.command,
+    deadline: Date.now() + routeTimeoutMs(paused.command),
+    submitEpoch: paused.epoch,
+  });
+  let result = live;
+  if (live.lost) {
+    // Expired from the plugin's result cache: the background poll kept the outcome.
+    const kept = await paused.background;
+    if (!kept.lost) result = kept;
+  }
+  delete result.lost;
+  delete result.resubmit;
+  return result;
 }
 
 /**

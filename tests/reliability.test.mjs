@@ -116,6 +116,159 @@ describe("main-thread stall detection (issue: commands hanging on a frozen edito
   });
 });
 
+describe("native dialogs blocking the editor (plugin protocolVersion 3)", () => {
+  /** @type {MockBridge} */ let bridge;
+  /** @type {McpTestClient} */ let client;
+
+  // As MCPDialogProbe reports Unity 6's real save prompt.
+  const SAVE_PROMPT = {
+    id: "130aa6-8df1f19d6ffae28",
+    kind: "dialog",
+    title: "Scene(s) Have Been Modified",
+    message: "Do you want to save the changes you made in the scenes:\n Untitled\n\nYour changes will be lost if you don't save them.",
+    buttons: ["Save", "Don't Save", "Cancel"],
+    clickable: true,
+    blockedMs: 1100,
+    defaultButton: "Save",
+    cancelButton: "Cancel",
+  };
+  const CONFIRM = { ...SAVE_PROMPT, id: "150bb2-8df1f19d7000001", title: "Confirm", message: "Really?", buttons: ["Yes", "No"], defaultButton: "Yes", cancelButton: "No" };
+  const idleEditor = () => ({ mainThreadStallMs: 0, busy: false, busyReason: null, executing: null, frozen: false, dialog: null });
+
+  before(async () => {
+    bridge = new MockBridge({ instance: { protocolVersion: 3 } });
+    bridge.on("editor/execute-menu-item", (p) => ({ success: true, executed: p.menuPath }));
+    await bridge.start();
+    client = new McpTestClient({ env: { ...bridge.env(), UNITY_QUEUE_POLL_TIMEOUT: "4000" } }).start();
+    await client.initialize();
+    await client.callTool("unity_editor_state"); // discovery + context banner out of the way
+  });
+
+  after(async () => {
+    await client.close();
+    await bridge.stop();
+  });
+
+  const clickDialog = (dialogId, button) =>
+    client.callTool("unity_advanced_tool", { tool: "unity_editor_dialog_click", params: { dialogId, button } });
+
+  test("a command queued behind a dialog is cancelled at once and told the dialog's text and buttons", async () => {
+    bridge.editor = { ...idleEditor(), mainThreadStallMs: 1100, busy: true, executing: "editor/execute-code", frozen: true, dialog: SAVE_PROMPT };
+    bridge.cancels = [];
+    const started = Date.now();
+    const { payload, isError } = await client.callTool("unity_scene_info");
+
+    assert.equal(isError, true);
+    assert.equal(payload.executed, "no", "cancelled before it started");
+    assert.match(payload.error, /Dialog is blocking this command: "Scene\(s\) Have Been Modified" — "Do you want to save/);
+    assert.match(payload.error, /Pick one: \["Save","Don't Save","Cancel"\]/);
+    assert.match(payload.error, /unity_editor_dialog_click.*130aa6-8df1f19d6ffae28/);
+    assert.match(payload.error, /did NOT run\. Answer the dialog, then call the command again/);
+    assert.equal(payload.dialog.id, SAVE_PROMPT.id, "structured dialog for the agent");
+    assert.equal(bridge.cancels.length, 1);
+    assert.ok(Date.now() - started < 2500, "reported on the first poll, not after the stall timeout");
+  });
+
+  test("the command that raised the dialog is reported as paused, then clicking returns its real result", async () => {
+    bridge.editor = idleEditor();
+    bridge.cancels = [];
+    bridge.clicks = [];
+    bridge.holdDialog = SAVE_PROMPT;
+
+    const paused = await client.callTool("unity_execute_menu_item", { menuPath: "File/New Scene" });
+    assert.equal(paused.isError, true);
+    assert.equal(paused.payload.executed, "paused");
+    assert.match(paused.payload.error, /Your command raised it and is paused inside Unity/);
+    assert.match(paused.payload.error, /do NOT send it again/);
+    assert.equal(paused.payload.dialog.id, SAVE_PROMPT.id);
+    assert.equal(bridge.cancels.length, 0, "an executing command is never cancelled");
+
+    const clicked = await clickDialog(SAVE_PROMPT.id, "Don't Save");
+    assert.equal(clicked.isError, false);
+    assert.deepEqual(bridge.clicks, [{ dialogId: SAVE_PROMPT.id, button: "Don't Save" }]);
+    assert.equal(clicked.payload.data.clicked, true);
+    assert.equal(clicked.payload.data.button, "Don't Save");
+    assert.equal(clicked.payload.data.resumedCommand.success, true, "the held command finished");
+    assert.equal(clicked.payload.data.resumedCommand.data.executed, "File/New Scene");
+  });
+
+  test("a dialog that leads to another is reported again through the resumed command", async () => {
+    bridge.editor = idleEditor();
+    bridge.holdDialog = SAVE_PROMPT;
+    bridge.dialogQueue = [CONFIRM];
+
+    await client.callTool("unity_execute_menu_item", { menuPath: "File/New Scene" });
+    const first = await clickDialog(SAVE_PROMPT.id, "Save");
+    const next = first.payload.data.resumedCommand;
+    assert.equal(next.executed, "paused", "still held, by the next dialog");
+    assert.equal(next.dialog.id, CONFIRM.id);
+    assert.match(next.error, /"Confirm" — "Really\?"/);
+
+    const second = await clickDialog(CONFIRM.id, "Yes");
+    assert.equal(second.payload.data.resumedCommand.success, true);
+  });
+
+  test("a stale dialog id is refused with the dialog that is actually open", async () => {
+    bridge.editor = { ...idleEditor(), mainThreadStallMs: 1100, dialog: CONFIRM };
+    const { payload, isError } = await clickDialog(SAVE_PROMPT.id, "Save");
+    assert.equal(isError, true);
+    assert.match(payload.error, /is now "Confirm"/);
+    assert.equal(payload.dialog.id, CONFIRM.id);
+    bridge.editor = idleEditor();
+  });
+
+  test("when a human answers first, clicking still delivers the paused command's result", async () => {
+    bridge.editor = idleEditor();
+    bridge.holdDialog = SAVE_PROMPT;
+    const paused = await client.callTool("unity_execute_menu_item", { menuPath: "File/Save" });
+    assert.equal(paused.payload.executed, "paused");
+
+    bridge.editor.dialog = null; // the user clicked in Unity
+    bridge.releaseHeld();
+    const { payload, isError } = await clickDialog(SAVE_PROMPT.id, "Cancel");
+    assert.equal(isError, false);
+    assert.equal(payload.data.clicked, false);
+    assert.equal(payload.data.resumedCommand.data.executed, "File/Save");
+  });
+
+  test("a progress window is not a question: the command waits and completes", async () => {
+    bridge.editor = { ...idleEditor(), mainThreadStallMs: 1500, dialog: { ...SAVE_PROMPT, kind: "progress", title: "Hold on…", clickable: false } };
+    const { payload, isError } = await client.callTool("unity_scene_info");
+    assert.equal(isError, false, JSON.stringify(payload));
+    bridge.editor = idleEditor();
+  });
+
+  test("a window drawn by Unity is reported as needing the user", async () => {
+    bridge.editor = { ...idleEditor(), mainThreadStallMs: 1500, frozen: true, dialog: { ...SAVE_PROMPT, kind: "window", title: "Scene Template", buttons: [], clickable: false } };
+    const { payload } = await client.callTool("unity_scene_info");
+    assert.equal(payload.executed, "no");
+    assert.match(payload.error, /"Scene Template"[\s\S]*cannot be clicked through MCP: ask the user/);
+    bridge.editor = idleEditor();
+  });
+});
+
+describe("dialog clicking against a plugin without dialog support", () => {
+  test("is refused without calling the plugin", async () => {
+    const bridge = new MockBridge(); // protocolVersion 2
+    await bridge.start();
+    const client = new McpTestClient({ env: bridge.env() }).start();
+    try {
+      await client.initialize();
+      await client.callTool("unity_editor_state");
+      const { payload, isError } = await client.callTool("unity_advanced_tool", {
+        tool: "unity_editor_dialog_click",
+        params: { dialogId: "x", button: "Cancel" },
+      });
+      assert.equal(isError, true);
+      assert.match(payload.error, /cannot answer dialogs/);
+      assert.equal(bridge.seen.some((r) => r.route === "dialog/click"), false);
+    } finally {
+      await client.close();
+      await bridge.stop();
+    }
+  });
+});
+
 describe("Unity console capture (issue: 'success' that did nothing)", () => {
   /** @type {MockBridge} */ let bridge;
   /** @type {McpTestClient} */ let client;

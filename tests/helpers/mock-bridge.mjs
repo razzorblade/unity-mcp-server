@@ -5,6 +5,7 @@
 //   GET  /api/queue/status?ticketId=X  → ticket object ({ status, result })
 //   GET  /api/queue/info               → queue stats
 //   GET  /api/context[/{category}]     → project context (404 by default, like a project without Assets/MCP/Context)
+//   POST /api/dialog/click             → answer the simulated native dialog (protocolVersion 3)
 //   POST /api/{route}                  → legacy synchronous execution
 // Listens on an ephemeral port (127.0.0.1:0) so parallel test files never collide.
 
@@ -43,6 +44,19 @@ export class MockBridge {
     this.editor = { mainThreadStallMs: 0, busy: false, busyReason: null, executing: null, frozen: false };
     /** @type {Array<{ticketId: string, result: object}>} queue/cancel calls received */
     this.cancels = [];
+    /**
+     * Native-dialog simulation (protocolVersion 3). With `holdDialog` set, the next ticket starts
+     * Executing and raises that dialog, like File > New Scene on a dirty scene. A click answers
+     * `editor.dialog`; the next entry of `dialogQueue` then appears (chained dialogs), and once
+     * none is left the held ticket completes.
+     * @type {object|null}
+     */
+    this.holdDialog = null;
+    /** @type {object[]} */
+    this.dialogQueue = [];
+    /** @type {Array<{dialogId: string, button: string}>} dialog/click calls received */
+    this.clicks = [];
+    this._held = null;
     /** @type {Map<string, (params: object) => object>} route → responder returning the plugin-side result object */
     this.routes = new Map();
     /** @type {SeenRequest[]} */
@@ -127,8 +141,33 @@ export class MockBridge {
       isUpdating: false,
       isBakingLighting: false,
       applicationFocused: true,
+      ...(this._held ? { executing: this._held.route, executingTicketId: this._held.ticket.ticketId } : {}),
       ...state,
     };
+  }
+
+  /** Complete the ticket a dialog is holding (as if a human answered it in Unity). */
+  releaseHeld() {
+    const held = this._held;
+    this._held = null;
+    if (held) held.complete();
+  }
+
+  /** POST /api/dialog/click — mirrors the plugin's MCPDialogProbe.Click outcomes. */
+  _handleDialogClick(res, body) {
+    const { dialogId, button } = JSON.parse(body || "{}");
+    this.clicks.push({ dialogId, button });
+    const dialog = this.editor.dialog;
+    if (!dialog) return this._json(res, 404, { error: "No dialog is blocking the editor (it may already have been answered)." });
+    if (dialog.id !== dialogId) {
+      return this._json(res, 409, { error: `The blocking dialog is now "${dialog.title}" (id ${dialog.id}), not ${dialogId}. Read it before answering.`, current: dialog });
+    }
+    const label = (dialog.buttons || []).find((b) => b.toLowerCase() === String(button).toLowerCase());
+    if (!label) return this._json(res, 400, { error: `"${dialog.title}" has no button "${button}".`, current: dialog });
+
+    this.editor.dialog = this.dialogQueue.shift() ?? null;
+    if (!this.editor.dialog) this.releaseHeld();
+    return this._json(res, 200, { clicked: true, button: label, dialog: dialog.title, dismissed: true });
   }
 
   _json(res, code, obj) {
@@ -207,7 +246,15 @@ export class MockBridge {
             ticket.errorMessage = err.message;
           }
         };
-        this.processingDelayMs > 0 ? setTimeout(complete, this.processingDelayMs) : complete();
+        if (this.holdDialog && !this.editor.frozen) {
+          // The command raises a native dialog: it stays Executing until the dialog is answered.
+          ticket.status = "Executing";
+          this._held = { ticket, route, complete };
+          this.editor.dialog = this.holdDialog;
+          this.holdDialog = null;
+        } else {
+          this.processingDelayMs > 0 ? setTimeout(complete, this.processingDelayMs) : complete();
+        }
         const accepted = { ticketId, status: "Queued", position: this._tickets.size };
         if (v2) accepted.epoch = this.instance.epoch;
         return this._json(res, 202, accepted);
@@ -217,6 +264,10 @@ export class MockBridge {
         const ticket = this._tickets.get(url.searchParams.get("ticketId"));
         if (!ticket) return this._json(res, 404, v2 ? { error: "Ticket not found", epoch: this.instance.epoch } : { error: "Ticket not found" });
         return this._json(res, 200, v2 ? { ...ticket, editor: this._editorSnapshot() } : ticket);
+      }
+
+      if (path === "dialog/click" && req.method === "POST" && this.instance.protocolVersion >= 3) {
+        return this._handleDialogClick(res, body);
       }
 
       if (path === "queue/info") {

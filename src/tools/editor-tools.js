@@ -283,6 +283,28 @@ export const editorTools = [
     inputSchema: { type: "object", properties: {} },
     handler: async () => formatResult(await bridge.getEditorState()),
   },
+  {
+    name: "unity_editor_dialog_click",
+    description:
+      "Answer the native dialog blocking the Unity Editor (e.g. \"Save / Don't Save / Cancel\"), as reported in a failed " +
+      "command's `dialog` or in unity_editor_ping. Then returns the command the dialog was holding as `resumedCommand` " +
+      "(do not resend it); a further dialog comes back the same way. Buttons like \"Don't Save\" discard work — when the " +
+      "changes may be the user's, ask first. Windows editor, plugin with dialog support.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        dialogId: { type: "string", description: "dialog.id exactly as reported (a different live dialog is refused)" },
+        button: { type: "string", description: "A button label from dialog.buttons, or primary / cancel / alternate / default" },
+      },
+      required: ["dialogId", "button"],
+    },
+    handler: async ({ dialogId, button } = {}) => {
+      if (typeof dialogId !== "string" || !dialogId || typeof button !== "string" || !button) {
+        return formatResult({ success: false, error: "Both 'dialogId' and 'button' are required: read them from the reported dialog." });
+      }
+      return formatResult(await bridge.clickDialog(dialogId, button));
+    },
+  },
 
   // â”€â”€â”€ Scene Management â”€â”€â”€
   {

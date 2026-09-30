@@ -461,6 +461,8 @@ export async function getInstanceInfo(port) {
             mainThreadStallMs: data.mainThreadStallMs,
             isPlaying: data.isPlaying === true,
             isCompiling: data.isCompiling === true,
+            // Plugins >= protocolVersion 3: the native dialog holding the editor, by title.
+            ...(data.dialog ? { dialog: data.dialog.title ?? "(untitled)" } : {}),
           }
         : undefined;
     return {

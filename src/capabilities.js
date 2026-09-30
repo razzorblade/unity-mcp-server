@@ -20,6 +20,9 @@ export const PLUGIN_FEATURES = {
   OFF_THREAD_HEALTH: 2,
   QUEUE_CANCEL: 2,
   LIGHTING_BAKE: 2,
+  // protocolVersion 3: health snapshots name the native dialog blocking the main thread
+  // (`dialog`) and the executing ticket; POST dialog/click answers that dialog.
+  DIALOG_DETECTION: 3,
 };
 
 /**

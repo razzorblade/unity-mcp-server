@@ -17,7 +17,7 @@ describe("splitToolTiers on the real tool set", () => {
 
   test("tier counts are pinned (update deliberately when the surface changes)", () => {
     assert.equal(split.coreCount, 70, "core tier count");
-    assert.equal(split.advancedCount, 291, "advanced tier count");
+    assert.equal(split.advancedCount, 292, "advanced tier count");
     assert.equal(split.coreCount + split.advancedCount, ALL_TOOLS.length);
   });
 

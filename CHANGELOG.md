@@ -4,9 +4,16 @@ All notable changes to this package will be documented in this file.
 
 ## [Unreleased]
 
-Companion to the plugin's FishNet integration and `asset/refresh` route. Against older plugins these tools return unknown-route errors.
+Companion to the plugin's FishNet integration, `asset/refresh` route and blocking-dialog detection (protocol 3). Against older plugins these tools return unknown-route errors. Dialog handling degrades to the existing stall report.
 
 ### Added
+- **Blocking dialogs are reported with their text and buttons, and can be answered.** Before, a command the dialog held waited out its full deadline (120s) and returned "outcome unknown". A command queued behind it failed only after a 20s stall, with the guess "modal dialog or long synchronous editor operation". Now, on the first poll that sees the plugin's `dialog` state:
+  - **Queued behind the dialog:** the command is cancelled with `executed: "no"`. The error reads *Dialog is blocking this command: "<title>" — "<message>". Pick one: [buttons]* and spells out the exact follow-up call.
+  - **Raised it (executing):** the command cannot be cancelled. It is reported as the new **`executed: "paused"`**: it finishes once the dialog is answered, so it must not be resent. `executingTicketId` tells "your command raised it" from "running behind it".
+  - **`unity_editor_dialog_click {dialogId, button}`** (advanced tier) presses a button, by label or by role (`primary` / `cancel` / `alternate` / `default`). It then waits for the held command and returns its real result as `resumedCommand`. A chained dialog comes back as that command's `paused` result. If a human answered first, the click still returns the result.
+  - A background poll keeps the held command's result beyond the plugin's 60s result cache.
+  - File panels can only be dismissed. Windows drawn by Unity (`kind: "window"`) and a project with clicking disabled are reported as needing the user. Progress windows never stop a command.
+  - The failure payload carries a structured `dialog`, `unity_list_instances` shows the blocking dialog's title, and the server instructions explain `"paused"`.
 - **`unity_asset_refresh`** (core tier) runs Assets > Refresh (Ctrl+R): it imports files changed outside Unity and compiles changed scripts. It then waits server-side for the compile and domain reload and returns the outcome (`none` / `succeeded` / `failed` with the compile errors / `pending`). Unity's own Auto Refresh only runs when the editor window regains focus. An explicit refresh runs whenever the main thread ticks, and it keeps ticking while the editor is unfocused, so agents that edit files with their own tools no longer need anyone to click into Unity. `forceRecompile` recompiles even with no changes, and `waitSeconds` (default 120, `0` = don't wait) bounds the wait.
 - **18 Fish-Networking (FishNet 4.x) tools** in the advanced tier, `fishnet` category. Tool names map straight to plugin routes.
   - Inspection: `unity_fishnet_status`, `unity_fishnet_get_network_object` (live SyncVar values), `unity_fishnet_list_network_objects` and `unity_fishnet_list_prefabs`.
@@ -14,8 +21,9 @@ Companion to the plugin's FishNet integration and `asset/refresh` route. Against
   - Play Mode: `unity_fishnet_start` (waits until connected), `unity_fishnet_stop`, `unity_fishnet_list_connections`, `unity_fishnet_spawn`, `unity_fishnet_despawn`, `unity_fishnet_set_ownership`, `unity_fishnet_kick`, `unity_fishnet_load_scene` and `unity_fishnet_unload_scene`.
 
 ### Changed
-- Tool count 352 → 371 (70 core + 291 advanced). `tools/list` grows from 47.9 KB to 48.4 KB for the one new core tool, and the rich and compact payload budgets were raised to 49.8 KB and 24.3 KB for it.
-- Tests: 101 → 108.
+- Tool count 352 → 372 (70 core + 292 advanced). `tools/list` grows from 47.9 KB to 48.4 KB for the one new core tool, and the rich and compact payload budgets were raised to 49.8 KB and 24.3 KB for it. The dialog tool is advanced-tier, so `tools/list` is unchanged by it.
+- Tests: 101 → 117.
+  - Dialogs: seven reliability tests against a mock plugin that can hold a ticket behind a simulated dialog. They cover queued → cancelled with the dialog text, executing → `paused`, click → `resumedCommand`, a chained dialog, a stale dialog id, a human answering first, progress windows ignored and Unity-drawn windows reported. An eighth refuses clicking against a protocol-2 plugin without calling it. A unit test covers the new `DIALOG_DETECTION` capability.
   - FishNet: the tier split pins the FishNet count and route parity, and a protocol test covers the deferred-route dispatch, `isError` on a plugin refusal and keyword discovery.
   - Refresh: four reliability tests run the wait against an unfocused mock editor. They cover nothing to compile, a compile with a domain reload, a failed compile returning its errors, and `waitSeconds: 0`.
 

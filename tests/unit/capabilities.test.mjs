@@ -18,6 +18,11 @@ describe("pluginSupports", () => {
     assert.equal(pluginSupports({ protocolVersion: "1" }, "UNKNOWN_ROUTE_404"), false, "non-numeric version is not trusted");
   });
 
+  test("dialog answering needs protocolVersion 3", () => {
+    assert.equal(pluginSupports({ protocolVersion: 2 }, "DIALOG_DETECTION"), false);
+    assert.equal(pluginSupports({ protocolVersion: 3 }, "DIALOG_DETECTION"), true);
+  });
+
   test("unknown features never pass", () => {
     assert.equal(pluginSupports({ protocolVersion: 99 }, "NOT_A_FEATURE"), false);
   });
